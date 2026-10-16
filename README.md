@@ -31,7 +31,7 @@ Built on the same design as [rg-fzf](https://github.com/officialparacite/rg-fzf)
 ## Installation
 
 ```bash
-git clone <repo-url> rg-fzf-kiro
+git clone https://github.com/officialparacite/rg-fzf-kiro.git
 chmod +x rg-fzf-kiro/rg-fzf-kiro.sh
 cp rg-fzf-kiro/rg-fzf-kiro.sh ~/.local/bin/rg-fzf-kiro   # any directory on your PATH
 ```
@@ -39,10 +39,19 @@ cp rg-fzf-kiro/rg-fzf-kiro.sh ~/.local/bin/rg-fzf-kiro   # any directory on your
 ## Usage
 
 ```bash
-rg-fzf-kiro                # search all saved sessions
-rg-fzf-kiro --reindex      # rebuild the search index from scratch first
-rg-fzf-kiro --index-only   # just update the index (e.g. from a scheduled job) and exit
+rg-fzf-kiro
 ```
+
+Every start brings the index up to date by itself: new sessions, new messages, renamed titles and deleted sessions are all picked up, reading only what changed. The first run reads your whole history and takes a few seconds; after that, startup takes a fraction of a second.
+
+Sessions started while the picker is open appear the next time you start it. Live tags don't wait: they are checked on every reload.
+
+You normally won't need these options:
+
+| Option | What it does |
+|--------|--------------|
+| `--reindex` | Throw the index away and rebuild it from scratch before starting. Only for when something looks wrong; the index already rebuilds any session whose copy doesn't match. |
+| `--index-only` | Update the index and exit without opening the picker, e.g. from a scheduled job. |
 
 ## Keybindings
 
@@ -163,4 +172,4 @@ Builds a throwaway sessions folder and drives the real tool in a pseudo-terminal
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
