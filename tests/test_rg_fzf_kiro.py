@@ -120,6 +120,7 @@ session("ad3", "Same dir twin", "2026-10-01T10:00:00Z", "2026-09-07T10:00:00Z", 
     prompt("twin session in the same directory on the same day"),
     reply("Reading the file now.", ("read", {"path": "/src/other.rs"})),
     results("fn main() { magicToolWord }"),
+    reply("wrapme " + "x" * 400 + " ZZTAILWORD"),
 ])
 open(f"{SESS}/broken.json", "w").write("{ not json")   # unreadable metadata
 open(f"{SESS}/notes.txt", "w").write("not a session")
@@ -572,7 +573,7 @@ if helper2:
                          env=dict(os.environ, FZF_PREVIEW_COLUMNS="100")).stdout
     check("preview: marker comments colored by who wrote them",
           b"\x1b[1;36m<!-- you \xc2\xb7 1 -->\x1b[0m" in out and b"\x1b[1;32m<!-- kiro \xc2\xb7 2 -->\x1b[0m" in out, out[-400:])
-    check("preview: selected line marked", re.search(rb"\x1b\[1;33m>\x1b\[90m *2\x1b\[0m", out) is not None, out[-400:])
+    check("preview: selected line marked", re.search(rb"\x1b\[1;33m>(\x1b\[0m)?\x1b\[90m *2\x1b\[0m", out) is not None, out[-400:])
     if shutil.which("bat"):
         check("preview: text highlighted by bat (Markdown)", b"\x1b[38;" in out or b"\x1b[48;" in out, out[-300:])
 else:
@@ -659,6 +660,46 @@ s = Session()
 s.find(b"canary stage", "b2")
 raw = s.finish(b"\r")
 check("Enter prints the line as shown", raw == f"~/proj/a b/c/{local(CREATED['b2'], '%Y-%m-%d')} #{short['b2']}.chat:5:7:kiro│ Use a canary stage first, then promote.".encode(), raw)
+
+print("--- preview keys")
+s = Session()
+s.find(b"wrapme", "ad3")
+before = len(s.out)
+s.pump(1.5)
+check("long line cut off without wrapping", b"ZZTAILWORD" not in s.screen(before) and b"ZZTAILWORD" not in s.screen(), s.screen()[-300:])
+mark = len(s.out)
+s.key(b"\x1bw")
+check("Alt-W wraps preview lines", b"ZZTAILWORD" in s.until(mark, b"ZZTAILWORD"), s.screen(mark)[-300:])
+mark = len(s.out)
+s.key(b"\x1bn")
+s.pump(1)
+nums_off = s.screen(mark)
+check("Alt-N hides preview line numbers", re.search(rb"\n *>? +[0-9]+ <!-- kiro", nums_off.replace(b"\r", b"\n")) is None
+      and b"<!-- kiro" in nums_off, nums_off[-400:])
+mark = len(s.out)
+s.key(b"\x1bn")
+check("Alt-N again shows them", re.search(rb"[0-9]+ <!-- (you|kiro)", s.until(mark, b"<!-- kiro")) is not None, s.screen(mark)[-400:])
+def keys_file_opened(key):
+    if os.path.exists(editor_log):
+        os.remove(editor_log)
+    s.key(key, 2)
+    log = open(editor_log).read().split("\n") if os.path.exists(editor_log) else []
+    path = log[0] if log else ""
+    ok = path.endswith("/rg-fzf-kiro-keybindings.txt") and os.path.isfile(path)
+    return ok, path, log
+ok, path, log = keys_file_opened(b"\x1b/")
+check("Alt-/ opens the keybinding list in $EDITOR", ok and len(log) == 2, log)
+if ok:
+    text = open(path).read()
+    check("...as a read-only file", (os.stat(path).st_mode & 0o222) == 0, oct(os.stat(path).st_mode))
+    check("...listing every key, nothing else", text.startswith("Keybindings:\n") and "Toggle line wrapping" in text
+          and "Alt-/  F1" in text and "Environment" not in text and "Usage:" not in text, text[:300])
+check("...and returns to the picker with the preview unchanged", s.state()[0] == "wrapme" and b"<!-- kiro" in s.screen()[-3000:])
+ok, path2, log = keys_file_opened(b"\x1bOP")
+check("F1 opens the same list", ok and path2 == path, log)
+check("header lists M-/:keys", b"M-/:keys" in s.screen())
+check("query untouched by these keys", s.state()[0] == "wrapme")
+s.finish(b"\x1b")
 
 print("--- index updates seen by the picker")
 with open(f"{SESS}/{ID['c3']}.jsonl", "a") as f:

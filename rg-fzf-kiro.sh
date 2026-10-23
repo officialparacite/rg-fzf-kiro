@@ -30,6 +30,9 @@ Keybindings:
   Ctrl-P      Toggle preview
   Ctrl-D      Scroll preview down
   Ctrl-U      Scroll preview up
+  Alt-W       Toggle line wrapping in the preview
+  Alt-N       Toggle line numbers in the preview
+  Alt-/  F1   Open these keybindings (read-only) in $EDITOR
   Esc         Exit
 
 Rows show the session's directory (~ is your home folder), the date it started
@@ -527,15 +530,19 @@ perl "$STATE/indexer.pl" "$CACHE" "$SESSIONS" "$FORMAT" "$HOME_DIR" "$REINDEX" \
 # COLUMN and TEXT joined by NUL + ':', so the fields split exactly.
 # ===========================================================================
 
-HEADER_CHAT='C-e:edit | M-enter:json | C-f:sessions | M-l:live | M-t:tools | M-s:subagents | M-p:pcre2'
-HEADER_SESSIONS='C-e:edit | M-enter:json | C-f:chat | M-l:live | M-t:tools | M-s:subagents | M-p:pcre2'
+HEADER_CHAT='C-e:edit | M-enter:json | C-f:sessions | M-l:live | M-t:tools | M-s:subagents | M-p:pcre2 | M-/:keys'
+HEADER_SESSIONS='C-e:edit | M-enter:json | C-f:chat | M-l:live | M-t:tools | M-s:subagents | M-p:pcre2 | M-/:keys'
 
 # Picker state in $STATE: content-q and file-q hold the saved query of each mode;
 # live, tools, sub and pcre2 exist while that toggle is on; listing exists while the
 # list shows sessions (empty query) rather than matching lines; in-sessions exists
-# while the session filter is active.
+# while the session filter is active; nonum exists while preview line numbers are off.
+# rg-fzf-kiro-keybindings.txt is the read-only keybinding list that Alt-/ opens.
 SEARCH="$STATE/search.sh"
 ACTIONS="$STATE/actions.sh"
+KEYS_FILE="$STATE/rg-fzf-kiro-keybindings.txt"
+show_help | sed -n '/^Keybindings:/,/^Environment:/p' | sed '$d' > "$KEYS_FILE"
+chmod 444 "$KEYS_FILE"
 
 # Colors for who wrote each message, and reading the marker comments that start each
 # message in a copy ("<!-- kiro · 12 -->"). Shared by the list, preview and JSON.
@@ -605,6 +612,7 @@ cat > "$STATE/preview.pl" << 'PERL'
 use strict;
 use warnings;
 my ($roles, $file, $line, $state) = @ARGV;
+my $numbers = !-e "$state/nonum";    # Alt-N turns line numbers off
 require $roles;
 our (%ROLE, $MARKER);
 $line = 1 unless defined $line && $line =~ /^[0-9]+\z/ && $line > 0;
@@ -621,7 +629,7 @@ if (system('sh', '-c', 'command -v bat > /dev/null 2>&1') == 0) {
     if (open(my $w, '>:raw', $win)) {
         print $w map { "$_\n" } @text[$from - 1 .. $to - 1];
         close $w;
-        my $cols = ($ENV{FZF_PREVIEW_COLUMNS} // 80) - length($n) - 2;
+        my $cols = ($ENV{FZF_PREVIEW_COLUMNS} // 80) - ($numbers ? length($n) + 2 : 2);
         $cols = 20 if $cols < 20;
         if (open(my $b, '-|', 'bat', '--color=always', '--style=plain', '--paging=never', '--wrap=never',
                 '--language=markdown', "--terminal-width=$cols", '--highlight-line', $line - $from + 1, '--', $win)) {
@@ -641,8 +649,12 @@ for my $i (1 .. $n) {
     } elsif ($i >= $from && $i <= $to && @shown) {
         $t = $shown[$i - $from];
     }
-    my $mark = $i == $line ? "\e[1;33m>" : ' ';
-    printf "%s\e[90m%*d\e[0m %s\n", $mark, $width, $i, $t;
+    my $mark = $i == $line ? "\e[1;33m>\e[0m" : ' ';
+    if ($numbers) {
+        printf "%s\e[90m%*d\e[0m %s\n", $mark, $width, $i, $t;
+    } else {
+        print "$mark $t\n";
+    }
 }
 PERL
 
@@ -811,8 +823,8 @@ SCRIPT
 # Also draws the preview and builds the JSON output.
 {
     helper_header
-    printf 'SEARCH=%q\nACTIONS=%q\nROLES=%q\nPREVIEW=%q\nJSON_PL=%q\nJSON_JQ=%q\n' \
-        "$SEARCH" "$ACTIONS" "$STATE/roles.pl" "$STATE/preview.pl" "$STATE/json.pl" "$STATE/json.jq"
+    printf 'SEARCH=%q\nROLES=%q\nPREVIEW=%q\nJSON_PL=%q\nJSON_JQ=%q\n' \
+        "$SEARCH" "$STATE/roles.pl" "$STATE/preview.pl" "$STATE/json.pl" "$STATE/json.jq"
     printf 'HEADER_CHAT=%q\nHEADER_SESSIONS=%q\n' "$HEADER_CHAT" "$HEADER_SESSIONS"
     cat << 'SCRIPT'
 # Result file name ("<rel>.chat" or "<rel>.tools") -> session row.
@@ -869,6 +881,10 @@ case $1 in
             rm -f "$S/in-sessions"
             echo "execute-silent(printf '%s' {q} > '$S/file-q')+change-prompt($(prompt Chat))+change-header($HEADER_CHAT)+disable-search+reload('$SEARCH' --saved)+transform-query(cat '$S/content-q' 2>/dev/null)"
         fi
+        ;;
+    toggle-numbers)
+        if [[ -f $S/nonum ]]; then rm -f "$S/nonum"; else touch "$S/nonum"; fi
+        echo "refresh-preview"
         ;;
     preview)
         # $2 = result file name, $3 = line. Six header lines, then the conversation.
@@ -928,6 +944,7 @@ print_selection() {
 # Ctrl-E opens the readable copy in $EDITOR at the line. Editing it does not change
 # the session; the index notices and rebuilds the copy on the next start.
 EDIT_CMD="${EDITOR:-vim} $(printf '%q' "$TEXT")/{1} +{2}"
+KEYS_CMD="${EDITOR:-vim} $(printf '%q' "$KEYS_FILE")"
 
 fzf \
   --ansi \
@@ -954,5 +971,9 @@ fzf \
   --bind "ctrl-p:toggle-preview" \
   --bind "ctrl-d:preview-half-page-down" \
   --bind "ctrl-u:preview-half-page-up" \
+  --bind "alt-w:toggle-preview-wrap" \
+  --bind "alt-n:transform:'$ACTIONS' toggle-numbers" \
+  --bind "alt-/:execute:$KEYS_CMD" \
+  --bind "f1:execute:$KEYS_CMD" \
   --preview "'$ACTIONS' preview {1} {2}" \
   --preview-window 'up,60%,border-bottom,+{2}+6/3,~6' | print_selection

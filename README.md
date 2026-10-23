@@ -69,6 +69,9 @@ You normally won't need these options:
 | `Alt-Enter` | Same, but as JSON with each session's details and resume command |
 | `Ctrl-P` | Toggle the preview window |
 | `Ctrl-D` / `Ctrl-U` | Scroll the preview down / up |
+| `Alt-W` | Toggle wrapping of long lines in the preview, so you see each line in full (off by default) |
+| `Alt-N` | Toggle line numbers in the preview (on by default) |
+| `Alt-/` or `F1` | Open the list of keybindings, read-only, in `$EDITOR`; close it to return |
 | `Esc` | Exit |
 
 The prompt shows how your text is matched: `Chat (regex)`, `Chat (pcre2)` while PCRE2 is on, or `Sessions (fuzzy)`. Active toggles appear after it: `[L]` live only, `[T]` tool output, `[S]` subagent sessions, and `[P]` in the session filter while PCRE2 is on.
