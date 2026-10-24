@@ -28,6 +28,15 @@ Built on the same design as [rg-fzf](https://github.com/officialparacite/rg-fzf)
 | perl | Builds the index; included with macOS and most Linux systems | | |
 | bat | Optional; Markdown highlighting in the preview (falls back to plain text) | `brew install bat` | `apt install bat` |
 
+Check your versions before installing:
+
+```bash
+fzf --version   # needs 0.45 or newer
+rg --version    # look for +pcre2 in the features line, for Alt-P
+```
+
+Linux package managers often ship an older fzf. If `fzf --version` shows less than 0.45, install a newer one from the [fzf releases page](https://github.com/junegunn/fzf/releases) or with `git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf && ~/.fzf/install`. With an older fzf, rg-fzf-kiro starts but its keybindings fail.
+
 ## Installation
 
 ```bash
