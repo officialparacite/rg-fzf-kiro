@@ -6,7 +6,7 @@ keypresses, and reads results back through fzf's --listen API. A fake kiro-cli r
 how it was started, and background processes named kiro-cli-chat stand in for running
 sessions. Nothing touches your real sessions or index.
 
-Usage: python3 tests/test_rg_fzf_kiro.py     (needs rg, fzf, jq, perl; bat optional)
+Usage: python3 tests/test_rg_fzf_kiro.py     (needs rg, fzf, jq, perl, bat)
 """
 import calendar, fcntl, json, urllib.error, os, pty, re, select, shutil, signal, struct, subprocess, sys, tempfile, termios, time, urllib.request
 
@@ -281,6 +281,20 @@ rc, out, err = cli("-h")
 check("-h prints help", rc == 0 and "Usage:" in out and "Alt-Enter" in out and "Alt-L" in out and "Alt-K" not in out and not re.search(r"Alt-E\b", out))
 rc, out, err = cli("-x")
 check("unknown option is an error", rc == 1 and "unknown option" in err, err)
+def without(tool):
+    """Runs rg-fzf-kiro with a PATH that has every tool it needs except one."""
+    d = tempfile.mkdtemp()
+    for c in ["rg", "fzf", "jq", "perl", "bat", "bash", "cat", "sed", "grep", "cut", "tr", "xargs", "mktemp", "chmod",
+              "rm", "touch", "sleep", "sort", "awk", "getconf", "ps", "pgrep", "mkdir", "find"]:
+        if c != tool and shutil.which(c):
+            os.symlink(shutil.which(c), f"{d}/{c}")
+    p = subprocess.run(["/bin/bash", SCRIPT], cwd=H, env={"PATH": d, "HOME": H, "KIRO_SESSIONS_DIR": SESS,
+                       "RG_FZF_KIRO_CACHE": f"{H}/cache-without"}, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
+    shutil.rmtree(d)
+    return p.returncode, p.stderr.strip()
+for tool in ("rg", "fzf", "jq", "perl", "bat"):
+    check(f"refuses to start without {tool}", without(tool) == (1, f"rg-fzf-kiro: {tool} is not installed"), without(tool))
+check("...and builds no index then", not os.path.exists(f"{H}/cache-without"))
 rc, out, err = cli(env=dict(ENV, KIRO_SESSIONS_DIR=f"{H}/nope"))
 check("missing sessions folder is an error", rc == 1 and "no Kiro sessions" in err, err)
 
@@ -574,8 +588,7 @@ if helper2:
     check("preview: marker comments colored by who wrote them",
           b"\x1b[1;36m<!-- you \xc2\xb7 1 -->\x1b[0m" in out and b"\x1b[1;32m<!-- kiro \xc2\xb7 2 -->\x1b[0m" in out, out[-400:])
     check("preview: selected line marked", re.search(rb"\x1b\[1;33m>(\x1b\[0m)?\x1b\[90m *2\x1b\[0m", out) is not None, out[-400:])
-    if shutil.which("bat"):
-        check("preview: text highlighted by bat (Markdown)", b"\x1b[38;" in out or b"\x1b[48;" in out, out[-300:])
+    check("preview: text highlighted by bat (Markdown)", b"\x1b[38;" in out or b"\x1b[48;" in out, out[-300:])
 else:
     check("helper script found for preview color tests", False)
 

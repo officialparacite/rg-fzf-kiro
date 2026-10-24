@@ -26,7 +26,9 @@ Built on the same design as [rg-fzf](https://github.com/officialparacite/rg-fzf)
 | fzf | 0.45 or newer | `brew install fzf` | `apt install fzf` |
 | jq | Reads the session files; included with macOS 15+ | `brew install jq` | `apt install jq` |
 | perl | Builds the index; included with macOS and most Linux systems | | |
-| bat | Optional; Markdown highlighting in the preview (falls back to plain text) | `brew install bat` | `apt install bat` |
+| bat | Markdown highlighting in the preview | `brew install bat` | `apt install bat` |
+
+All of these are required; rg-fzf-kiro checks for them at startup and tells you which one is missing.
 
 Check your versions before installing:
 

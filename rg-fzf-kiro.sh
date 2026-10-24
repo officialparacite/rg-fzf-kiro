@@ -56,7 +56,7 @@ die() {
     exit 1
 }
 
-for cmd in rg fzf jq perl; do
+for cmd in rg fzf jq perl bat; do
     command -v "$cmd" > /dev/null || die "$cmd is not installed"
 done
 
@@ -623,8 +623,8 @@ my $n = @text;
 exit 0 unless $n;
 $line = $n if $line > $n;
 my ($from, $to) = ($line - 300 < 1 ? 1 : $line - 300, $line + 700 > $n ? $n : $line + 700);
-my @shown;
-if (system('sh', '-c', 'command -v bat > /dev/null 2>&1') == 0) {
+my @shown;    # stays empty (lines shown plain) if bat fails on this text
+{
     my $win = "$state/preview.$$";
     if (open(my $w, '>:raw', $win)) {
         print $w map { "$_\n" } @text[$from - 1 .. $to - 1];
