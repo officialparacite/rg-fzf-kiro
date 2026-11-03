@@ -10,13 +10,14 @@ Usage: python3 tests/test_rg_fzf_kiro.py     (needs rg, fzf, jq, perl, bat)
 """
 import calendar, fcntl, json, urllib.error, os, pty, re, select, shutil, signal, struct, subprocess, sys, tempfile, termios, time, urllib.request
 
-signal.alarm(480)  # hard stop so the suite can never hang
+signal.alarm(840)  # hard stop so the suite can never hang
 SCRIPT = os.environ.get("RGFK_SCRIPT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rg-fzf-kiro.sh")
 PORT = int(os.environ.get("RGFK_PORT", "6380"))
 ESC_RE = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]")
 
 H = os.path.realpath(tempfile.mkdtemp())   # harness root; also used as $HOME
-SESS = f"{H}/sessions"
+ROOT = f"{H}/sessions"                     # $KIRO_SESSIONS_DIR: V3 sessions in <workspace>/<id>/
+SESS = f"{ROOT}/cli"                       # V2 sessions
 CACHE = f"{H}/cache"
 WORK = f"{H}/work dir"                     # a session directory, with a space
 DEEP = f"{H}/proj/a b/c"                   # nested directory
@@ -129,9 +130,12 @@ editor_log = f"{H}/editor.log"
 open(f"{H}/bin/fake-editor", "w").write(f"#!/bin/bash\nprintf '%s\\n' \"$@\" > '{editor_log}'\n")
 os.chmod(f"{H}/bin/fake-editor", 0o755)
 
-run = f"{H}/run.sh"
-open(run, "w").write(open(SCRIPT).read().replace("\nfzf \\\n", f"\nfzf --listen {PORT} \\\n", 1))
-ENV = dict(os.environ, HOME=H, KIRO_SESSIONS_DIR=SESS, RG_FZF_KIRO_CACHE=CACHE,
+# Copies of the script that also listen on a port, so tests can read fzf's state.
+# run2 is the second rg-fzf-kiro in a chain.
+run, run2 = f"{H}/run.sh", f"{H}/run2.sh"
+for path, port in ((run, PORT), (run2, PORT + 1)):
+    open(path, "w").write(open(SCRIPT).read().replace("\nfzf \\\n", f"\nfzf --listen {port} \\\n", 1))
+ENV = dict(os.environ, HOME=H, KIRO_SESSIONS_DIR=ROOT, RG_FZF_KIRO_CACHE=CACHE,
            EDITOR=f"{H}/bin/fake-editor", PATH=f"{H}/bin:" + os.environ["PATH"])
 ENV.pop("XDG_CACHE_HOME", None)
 
@@ -140,13 +144,17 @@ def local(ts, fmt):
     return time.strftime(fmt, time.localtime(calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))))
 
 class Session:
-    def __init__(self, *args, env=ENV):
+    """rg-fzf-kiro in a pseudo-terminal. cmd: a bash command line to run instead (for pipes)."""
+    def __init__(self, *args, env=ENV, cmd=None, v2=True):
         self.out = b""
         self.last_key = 0
+        self.port = PORT
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.chdir(H)
-            os.execvpe("bash", ["bash", run, *args], env)
+            if cmd:
+                os.execvpe("bash", ["bash", "-c", cmd], env)
+            os.execvpe("bash", ["bash", run, *(["--v2"] if v2 else []), *args], env)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 45, 170, 0, 0))
         self.pump(3)
 
@@ -165,25 +173,32 @@ class Session:
             # Clear the query in one step (one change event) rather than with dozens
             # of backspaces, each of which runs a helper script
             self.pump(0.1)
-            urllib.request.urlopen(urllib.request.Request(f"http://localhost:{PORT}", data=b"change-query()"), timeout=10).read()
+            urllib.request.urlopen(urllib.request.Request(f"http://localhost:{self.port}", data=b"change-query()"), timeout=10).read()
             self.last_key = time.time()
             b = b[len(CLR):]
             if not b:
                 self.pump(wait)
                 return
             self.pump(0.3)
-        os.write(self.fd, b)
+        try:
+            os.write(self.fd, b)
+        except OSError:  # it already exited; the checks that follow will fail
+            pass
         self.last_key = time.time()
         self.pump(wait)
 
     def api(self):
         # fzf answers 503 while it is blocked writing to the terminal, so keep reading
-        # its output between tries
+        # its output between tries (or isn't listening yet, as the second of a chain)
         for attempt in range(80):
             try:
-                return json.load(urllib.request.urlopen(f"http://localhost:{PORT}?limit=300", timeout=5))
+                return json.load(urllib.request.urlopen(f"http://localhost:{self.port}?limit=300", timeout=5))
             except urllib.error.HTTPError as e:
                 if e.code != 503 or attempt == 79:
+                    raise
+                self.pump(0.25)
+            except urllib.error.URLError:
+                if attempt == 79:
                     raise
                 self.pump(0.25)
 
@@ -234,7 +249,7 @@ class Session:
 CLR = b"\x00CLEAR\x00"      # key() clears the query (Ctrl-U scrolls the preview here)
 fields = lambda line: line.split("\x00:")
 def sid8(line):
-    m = re.search(r"#([0-9a-z]{8})\.(chat|tools)$", fields(line)[0])
+    m = re.search(r"#([0-9a-z]{8})(?:_[A-Za-z0-9]+)?\.chat$", fields(line)[0])
     return m.group(1) if m else "?"
 ids = lambda m: [sid8(x) for x in m]
 
@@ -243,6 +258,11 @@ def cli(*args, env=ENV):
                        stdin=subprocess.DEVNULL, timeout=60)
     return p.returncode, p.stdout, p.stderr
 
+def cli_in(data, *args):
+    """rg-fzf-kiro with data piped to stdin (only for runs that stop before fzf opens)."""
+    p = subprocess.run(["bash", SCRIPT, *args], cwd=H, env=ENV, input=data, capture_output=True, timeout=60)
+    return p.returncode, p.stderr.decode(errors="replace").strip()
+
 def text_files():
     out = []
     for root, _, files in os.walk(f"{CACHE}/text"):
@@ -250,20 +270,20 @@ def text_files():
     return sorted(out)
 
 EXTRACT_JQ = re.search(r"cat > \"\$STATE/extract.jq\" << 'JQ'\n(.*?)\nJQ\n", open(SCRIPT).read(), re.S).group(1)
-def extract_full(sid, prefix):
+def extract_full(sid, path=None, asker=None):
     """What reading the whole session from scratch gives, using the script's own extractor."""
-    asker = "agent" if sid == ID["e5"] else "you"
+    asker = asker or ("agent" if sid == ID["e5"] else "you")
     r = subprocess.run(["jq", "-Rnr", "--arg", "asker", asker, "--argjson", "base", "0", EXTRACT_JQ],
-                       stdin=open(f"{SESS}/{sid}.jsonl", "rb"), capture_output=True)
-    return b"".join(l[1:] + b"\n" for l in r.stdout.split(b"\n") if l.startswith(prefix.encode()))
+                       stdin=open(path or f"{SESS}/{sid}.jsonl", "rb"), capture_output=True)
+    return r.stdout
 
 def index_file(key, ext):
     hits = [f for f in text_files() if f.endswith(f"#{short[key]}.{ext}")]
     return f"{CACHE}/text/{hits[0]}" if len(hits) == 1 else None
 
 def index_matches_full(key):
-    c, t = index_file(key, "chat"), index_file(key, "tools")
-    return bool(c and t) and open(c, "rb").read() == extract_full(ID[key], "C") and open(t, "rb").read() == extract_full(ID[key], "T")
+    c = index_file(key, "chat")
+    return bool(c) and open(c, "rb").read() == extract_full(ID[key])
 
 def expected_files(moved_g8=False, without=()):
     where = {k: "~/work dir" for k in KEYS}
@@ -271,7 +291,7 @@ def expected_files(moved_g8=False, without=()):
     if moved_g8:
         where["g8"] = "~/moved here"
     return sorted(f"{where[k]}/{local(CREATED[k], '%Y-%m-%d')} #{short[k]}.{e}"
-                  for k in KEYS if k not in without for e in ("chat", "tools"))
+                  for k in KEYS if k not in without for e in ("chat",))
 
 CACHE_PARTS = ["lock", "meta", "seen", "sessions.tsv", "state", "text", "version"]
 
@@ -279,6 +299,8 @@ CACHE_PARTS = ["lock", "meta", "seen", "sessions.tsv", "state", "text", "version
 print("--- command line")
 rc, out, err = cli("-h")
 check("-h prints help", rc == 0 and "Usage:" in out and "Alt-Enter" in out and "Alt-L" in out and "Alt-K" not in out and not re.search(r"Alt-E\b", out))
+check("-h lists Alt-U, Alt-R, Ctrl-O, piping, --v2 and -0", all(k in out for k in ("Alt-U", "Alt-R", "Ctrl-O", "command | rg-fzf-kiro", "--v2", "-0, --null")), out)
+check("-h no longer lists Alt-T", "Alt-T" not in out and "tool output" not in out, out)
 rc, out, err = cli("-x")
 check("unknown option is an error", rc == 1 and "unknown option" in err, err)
 def without(tool):
@@ -288,7 +310,7 @@ def without(tool):
               "rm", "touch", "sleep", "sort", "awk", "getconf", "ps", "pgrep", "mkdir", "find"]:
         if c != tool and shutil.which(c):
             os.symlink(shutil.which(c), f"{d}/{c}")
-    p = subprocess.run(["/bin/bash", SCRIPT], cwd=H, env={"PATH": d, "HOME": H, "KIRO_SESSIONS_DIR": SESS,
+    p = subprocess.run(["/bin/bash", SCRIPT], cwd=H, env={"PATH": d, "HOME": H, "KIRO_SESSIONS_DIR": ROOT,
                        "RG_FZF_KIRO_CACHE": f"{H}/cache-without"}, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
     shutil.rmtree(d)
     return p.returncode, p.stderr.strip()
@@ -311,13 +333,14 @@ check("corrupt record skipped, the rest kept", b"not json" not in chat_a1 and b"
 check("compaction summaries indexed, with their record", b"\n<!-- summary \xc2\xb7 5 -->\n## OBJECTIVE\nFix parser unicode crash\n\n" in chat_a1, chat_a1)
 check("copy is Markdown: a marker comment per message, text unlabelled",
       chat_a1.startswith(b"<!-- you \xc2\xb7 1 -->\nwhy does the parser crash on unicode input?\n\n<!-- kiro \xc2\xb7 2 -->\nThe tokenizer splits"), chat_a1[:200])
-check("thinking never indexed", all(b"secret thoughts" not in open(index_file(k, e), "rb").read() for k in KEYS for e in ("chat", "tools")))
-tools_ad3 = open(index_file("ad3", "tools"), "rb").read()
-check("tool calls and output go to the .tools file",
-      tools_ad3 == b'<!-- call \xc2\xb7 2 -->\nread {"path":"/src/other.rs"}\n\n<!-- output \xc2\xb7 3 -->\nfn main() { magicToolWord }\n\n', tools_ad3)
+check("thinking never indexed", all(b"secret thoughts" not in open(index_file(k, "chat"), "rb").read() for k in KEYS))
+chat_ad3 = open(index_file("ad3", "chat"), "rb").read()
+check("tool calls and output are not indexed", not any(f.endswith(".tools") for f in text_files())
+      and b"magicToolWord" not in chat_ad3 and b"other.rs" not in chat_ad3 and b"Reading the file now." in chat_ad3, chat_ad3)
 check("cache has only index parts", sorted(os.listdir(CACHE)) == CACHE_PARTS, os.listdir(CACHE))
 rows = [l.split("\t") for l in open(f"{CACHE}/sessions.tsv").read().splitlines()]
-check("session list: one row per readable session, 8 columns", len(rows) == 12 and all(len(r) == 8 for r in rows), rows)
+check("session list: one row per readable session, 10 columns", len(rows) == 12 and all(len(r) == 10 for r in rows), rows)
+check("...each a V2 session, with its file", all(r[8] == "v2" and r[9] == f"{SESS}/{r[0]}.jsonl" for r in rows), rows[:2])
 check("session list sorted by last update", [r[0][:8] for r in rows][:3] == [short["h9"], short["aa7"], short["c3"]], [r[0][:8] for r in rows])
 byid = {r[0]: r for r in rows}
 check("title kept exactly, including / and \\", byid[ID["b2"]][7] == "Deploy plan: prod/us-east-1 \\ rollout", byid[ID["b2"]])
@@ -425,7 +448,7 @@ rc, _, err = cli("--index-only", "--reindex")
 check("--reindex rebuilds everything", rc == 0 and all(index_matches_full(k) for k in KEYS) and text_files() == expected_files(moved_g8=True), err)
 open(f"{CACHE}/version", "w").write("1\n")
 cli("--index-only")
-check("index from an older version is rebuilt", open(f"{CACHE}/version").read() == "6\n" and all(index_matches_full(k) for k in KEYS))
+check("index from an older version is rebuilt", open(f"{CACHE}/version").read() == "7\n" and all(index_matches_full(k) for k in KEYS))
 
 shutil.rmtree(f"{CACHE}/text")
 shutil.rmtree(f"{CACHE}/state")
@@ -458,7 +481,7 @@ if CAN_SEE:
     check("a lock whose pid now belongs to another program is not live", not live["g8"])
 else:
     print("SKIP reused-pid check: process commands can't be read here (counted as live by design)")
-check("header shows the keys", all(k in s.screen() for k in (b"C-e:edit", b"M-enter:json", b"M-l:live")) and b"M-k" not in s.screen() and b"M-e:" not in s.screen())
+check("header shows the keys", all(k in s.screen() for k in (b"C-e:edit", b"M-enter:json", b"M-l:live")) and b"M-k" not in s.screen() and b"M-e:" not in s.screen() and b"M-t:" not in s.screen())
 check("prompt Chat (regex)>", b"Chat (regex)>" in s.screen())
 
 s.key(b"\x1bl")
@@ -477,14 +500,11 @@ check("result lines show who said it", any(fields(x)[-1] == "kiro│ Use a canar
 check("match highlighted", re.search(rb"31[;0-9]*mcanary", s.out) is not None)
 
 s.key(CLR + b"magicToolWord")
-check("tool output not searched by default", s.state()[1] == [])
+check("tool output never searched", s.state()[1] == [])
 s.key(b"\x1bt")
-q, m = s.state()
-check("Alt-T searches tool output", ids(m) == [short["ad3"]] and fields(m[0])[-1].startswith("output│"), m)
-check("prompt shows [T]", b"Chat (regex) [T]>" in s.screen())
+check("Alt-T does nothing (removed)", s.state()[1] == [] and b"[T]>" not in s.screen()[-3000:])
 s.key(CLR + b"other\\.rs")
-check("Alt-T includes tool calls", [fields(x)[-1][:5] for x in s.state()[1]] == ["call│"], s.state()[1])
-s.key(b"\x1bt")
+check("tool calls never searched", s.state()[1] == [])
 s.key(CLR + b"short replacement")
 check("search reflects the rebuilt session", ids(s.state()[1]) == [short["a1"]])
 s.key(CLR + b"twin session")
@@ -535,7 +555,7 @@ if helper:
     p = preview("b2")
     check("preview: title first, exactly as saved", p[0] == "title    Deploy plan: prod/us-east-1 \\ rollout", p[:2])
     check("preview: session id, full directory, dates, status",
-          p[1] == f"session  {ID['b2']}" and p[2] == f"dir      {DEEP}"
+          p[1] == f"session  {ID['b2']}  (v2)" and p[2] == f"dir      {DEEP}"
           and p[3] == f"started  {local('2026-10-02T10:00:00Z', '%Y-%m-%d %H:%M')}    updated  {local('2026-10-12T10:00:00Z', '%Y-%m-%d %H:%M')}"
           and p[4] == "status   saved", p[:6])
     body = [re.sub(r"^[ >] *[0-9]+ ", "", l) for l in p[6:]]
@@ -609,8 +629,9 @@ if d:
     check("JSON result: session details",
           (r.get("session_id"), r.get("title"), r.get("directory"), r.get("subagent"), r.get("live"), r.get("pid"))
           == (ID["b2"], "Deploy plan: prod/us-east-1 \\ rollout", DEEP, False, False, None), r)
-    check("JSON result: resume command", r.get("resume") == f"cd '{DEEP}' && kiro-cli chat --resume-id '{ID['b2']}'", r.get("resume"))
-    rr = subprocess.run(["bash", "-c", r.get("resume", "").replace("kiro-cli chat --resume-id", "printf '%s|%s' \"$PWD\"")], capture_output=True, text=True).stdout
+    check("JSON result: V2 resume command", r.get("resume") == f"cd '{DEEP}' && kiro-cli chat --v2 --resume-id '{ID['b2']}'", r.get("resume"))
+    check("JSON result: store", r.get("store") == "v2", r)
+    rr = subprocess.run(["bash", "-c", r.get("resume", "").replace("kiro-cli chat --v2 --resume-id", "printf '%s|%s' \"$PWD\"")], capture_output=True, text=True).stdout
     check("...which runs in the right directory with the right id", rr == f"{DEEP}|{ID['b2']}", rr)
     check("JSON result: line, role and text",
           (r.get("line"), r.get("column"), r.get("role"), r.get("record"), r.get("text")) == (5, 7, "kiro", 2, "Use a canary stage first, then promote."), r)
@@ -668,11 +689,11 @@ try:
 except ValueError:
     check("session-filter JSON is valid", False, raw[:400])
 
-# Enter still prints plain lines
+# Ctrl-O prints plain lines
 s = Session()
 s.find(b"canary stage", "b2")
-raw = s.finish(b"\r")
-check("Enter prints the line as shown", raw == f"~/proj/a b/c/{local(CREATED['b2'], '%Y-%m-%d')} #{short['b2']}.chat:5:7:kiro│ Use a canary stage first, then promote.".encode(), raw)
+raw = s.finish(b"\x0f")
+check("Ctrl-O prints the line as shown", raw == f"~/proj/a b/c/{local(CREATED['b2'], '%Y-%m-%d')} #{short['b2']}.chat:5:7:kiro│ Use a canary stage first, then promote.".encode(), raw)
 
 print("--- preview keys")
 s = Session()
@@ -712,6 +733,272 @@ ok, path2, log = keys_file_opened(b"\x1bOP")
 check("F1 opens the same list", ok and path2 == path, log)
 check("header lists M-/:keys", b"M-/:keys" in s.screen())
 check("query untouched by these keys", s.state()[0] == "wrapme")
+s.finish(b"\x1b")
+
+print("--- one result per session (Alt-U), roles (Alt-R)")
+# Two more sessions, newest of all: ae4 mentions uniqword in every role, af5 only in
+# a Kiro reply, after a prompt that doesn't
+for k in ("ae4", "af5"):
+    ID[k] = f"{k}00000-1111-2222-3333-444444444444"
+    short[k] = ID[k][:8]
+session("ae4", "Uniq one", "2026-10-17T10:00:00Z", "2026-10-17T12:00:00Z", [
+    prompt("uniqword first from you"),
+    reply("uniqword reply from kiro", ("read", {"path": "/uniqword/file"})),
+    results("uniqword tool output"),
+    rec("Compaction", {"summary": "uniqword in a summary"}),
+    prompt("uniqword again from you"),
+])
+session("af5", "Uniq two", "2026-10-17T09:00:00Z", "2026-10-17T11:00:00Z", [
+    prompt("nothing to see"), reply("uniqword only kiro says it")])
+label = lambda x: fields(x)[-1].split("\u2502")[0]
+s = Session()
+s.key(b"uniqword")
+q, m = s.state()
+check("uniqword: 4 rows from ae4, 1 from af5", ids(m) == [short["ae4"]] * 4 + [short["af5"]], m)
+mark = len(s.out)
+s.key(b"\x1bu")
+q, m = s.state()
+check("Alt-U: each session once", ids(m) == [short["ae4"], short["af5"]], m)
+check("...at its first match", [fields(x)[-1] for x in m] == ["you\u2502 uniqword first from you", "kiro\u2502 uniqword only kiro says it"], m)
+check("...prompt shows [U]", b"Chat (regex) [U]>" in s.until(mark, b"[U]>"))
+s.key(CLR + b"kiro")
+q, m = s.state()
+check("Alt-U: a session whose first 'kiro' is a message label still shows, with a real row",
+      short["ae4"] in ids(m) and short["af5"] in ids(m) and len(ids(m)) == len(set(ids(m)))
+      and all("<!--" not in fields(x)[-1][:12] for x in m), m)
+s.key(CLR + b"uniqword")
+s.key(b"\x1bu")
+check("Alt-U again: all rows back", len(s.state()[1]) == 5)
+
+mark = len(s.out)
+s.key(b"\x1br")
+q, m = s.state()
+check("Alt-R once: only your messages", [label(x) for x in m] == ["you", "you"] and ids(m) == [short["ae4"]] * 2, m)
+check("...prompt shows [R:you]", b"Chat (regex) [R:you]>" in s.until(mark, b"[R:you]"))
+mark = len(s.out)
+s.key(b"\x1br")
+q, m = s.state()
+check("Alt-R twice: only Kiro's, summaries included", [label(x) for x in m] == ["kiro", "summary", "kiro"]
+      and ids(m) == [short["ae4"], short["ae4"], short["af5"]], m)
+check("...prompt shows [R:kiro]", b"Chat (regex) [R:kiro]>" in s.until(mark, b"[R:kiro]"))
+s.key(b"\x1bu")
+q, m = s.state()
+check("Alt-R with Alt-U: Kiro's first message per session", [fields(x)[-1] for x in m]
+      == ["kiro\u2502 uniqword reply from kiro", "kiro\u2502 uniqword only kiro says it"], m)
+mark = len(s.out)
+s.key(b"\x06")
+check("session filter shows the same flags", b"Sessions (fuzzy) [U] [R:kiro]>" in s.until(mark, b"[R:kiro]"), s.screen(mark)[-300:])
+s.key(b"Uniq")
+check("...and the same rows", ids(s.state()[1]) == [], s.state())
+s.key(CLR + b"#" + short["af5"][:4].encode())
+check("...filtering them by id", ids(s.state()[1]) == [short["af5"]], s.state())
+s.key(CLR)
+s.key(b"\x06")
+s.key(b"\x01")
+out = s.finish(b"\x0f").decode().split("\n")
+check("Ctrl-O with Alt-U and Alt-R: one Kiro line per session",
+      [re.sub(r"^.*#([0-9a-z]{8})\.chat:([0-9]+):1:", r"\1 \2 ", x) for x in out]
+      == [f"{short['ae4']} 5 kiro\u2502 uniqword reply from kiro", f"{short['af5']} 5 kiro\u2502 uniqword only kiro says it"], out)
+s = Session()
+s.key(b"uniqword"); s.key(b"\x1br"); s.key(b"\x1br")
+mark = len(s.out)
+s.key(b"\x1br")
+check("Alt-R three times: everyone again", len(s.state()[1]) == 5 and b"[R:" not in s.until(mark, b"Chat (regex)>"), s.state())
+s.finish(b"\x1b")
+
+print("--- Enter prints the readable copies")
+copy = lambda k: index_file(k, "chat")
+s = Session()
+s.key(b"uniqword")
+s.wait_for(lambda q, m: len(m) == 5)
+s.key(b"\x01")
+out = s.finish(b"\r")
+check("Enter: each selected session's copy once, full path, newest first", out == f"{copy('ae4')}\n{copy('af5')}".encode(), out)
+check("...real files holding the matched text", b"uniqword only kiro says it" in open(copy("af5"), "rb").read())
+s = Session()
+s.key(b"uniqword")
+s.wait_for(lambda q, m: len(m) == 5)
+check("Enter with nothing selected: the current line's session", s.finish(b"\r") == copy("ae4").encode())
+s = Session()
+s.key(b"\t\t")
+check("Enter from the session list", s.finish(b"\r") == f"{copy('ae4')}\n{copy('af5')}".encode())
+s = Session()
+s.key(b"uniqword"); s.wait_for(lambda q, m: len(m) == 5)
+s.key(b"\x06"); s.key(b"#" + short["af5"][:4].encode())
+s.wait_for(lambda q, m: ids(m) == [short["af5"]])
+check("Enter from the session filter", s.finish(b"\r") == copy("af5").encode())
+s = Session("-0")
+s.key(b"uniqword")
+s.wait_for(lambda q, m: len(m) == 5)
+s.key(b"\x01")
+check("-0: Enter separates the paths with NUL", s.finish(b"\r") == f"{copy('ae4')}\0{copy('af5')}\0".encode())
+
+print("--- sessions piped in")
+check("empty pipe is an error", cli_in(b"") == (1, "rg-fzf-kiro: no sessions given on stdin"), cli_in(b""))
+check("blank lines only: same error", cli_in(b"\n \n") == (1, "rg-fzf-kiro: no sessions given on stdin"), cli_in(b"\n \n"))
+check("only unknown sessions is an error", cli_in(b"nope\n/tmp/zzz.jsonl\n") == (1, "rg-fzf-kiro: none of the sessions given on stdin are known"),
+      cli_in(b"nope\n"))
+check("--index-only ignores stdin", cli_in(b"", "--index-only") == (0, ""), cli_in(b"", "--index-only"))
+open(f"{H}/list.txt", "w").write(f"{copy('ae4')}\n  {SESS}/{ID['af5']}.jsonl\n{ID['e5']}\nbogus\n{ID['ae4']}\n\n")
+s = Session(cmd=f"bash '{run}' < '{H}/list.txt'")
+q, m = s.state()
+check("piped list: only those sessions, in session-list order", ids(m) == [short["ae4"], short["af5"], short["e5"]], m)
+check("...a subagent session named in the list is shown without Alt-S", short["e5"] in ids(m))
+check("...unknown entries reported", b"rg-fzf-kiro: skipped 1 unknown session(s) from stdin" in s.out, s.out[:300])
+s.key(b"canary")
+check("piped list: search covers only them", ids(s.state()[1]) == [short["e5"]], s.state())
+s.key(b"\x1bl")
+check("...Alt-L still applies on top", s.state()[1] == [], s.state())
+s.key(b"\x1bl")
+s.key(CLR + b"uniqword")
+check("piped list: other listed sessions searched", set(ids(s.state()[1])) == {short["ae4"], short["af5"]}, s.state())
+s.finish(b"\x1b")
+open(f"{H}/list0", "wb").write(f"{ID['af5']}\0{SESS}/{ID['ae4']}.json\0".encode())
+s = Session(cmd=f"cat '{H}/list0' | bash '{run}'")
+check("NUL-separated list, from a pipe", ids(s.state()[1]) == [short["ae4"], short["af5"]], s.state())
+s.finish(b"\x1b")
+
+print("--- chaining rg-fzf-kiro | rg-fzf-kiro")
+s = Session(cmd=f"bash '{run}' --v2 | bash '{run2}'")
+s.key(b"uniqword")
+s.wait_for(lambda q, m: len(m) == 5)
+try:
+    urllib.request.urlopen(f"http://localhost:{PORT + 1}", timeout=1)
+    waiting = False
+except urllib.error.URLError:
+    waiting = True
+check("chain: second waits until the first is done", waiting)
+s.key(b"\x01")
+s.key(b"\r", 3)
+s.port = PORT + 1
+s.last_key = 0
+q, m = s.state()
+check("chain: second lists only the picked sessions", ids(m) == [short["ae4"], short["af5"]], m)
+s.key(b"only kiro")
+check("chain: and searches only them", ids(s.state()[1]) == [short["af5"]], s.state())
+check("chain: final output", s.finish(b"\r") == copy("af5").encode())
+
+print("--- V3 sessions")
+s = Session(v2=False)
+check("without --v2 and no V3 sessions: a note, and an empty list", b"no V3 sessions yet; --v2 shows your V2 sessions" in s.out
+      and s.state()[1] == [], (s.out[:300], s.state()))
+s.finish(b"\x1b")
+
+def v3rec(i, typ, content=None, **kw):
+    payload = {"type": typ, **kw}
+    if content is not None:
+        payload["content"] = content
+    return json.dumps({"id": i, "timestamp": "2026-10-20T10:00:00.000Z", "payload": payload})
+def v3session(ws, sid, title, created, updated, recs, cwd=WORK, lock=None, **extra):
+    d = f"{ROOT}/{ws}/{sid}"
+    os.makedirs(d, exist_ok=True)
+    meta = {"schemaVersion": "1.0.0", "id": sid, "title": title, "workspacePaths": [cwd],
+            "createdAt": created, "lastModifiedAt": updated, "status": "idle", **extra}
+    open(f"{d}/session.json", "w").write(json.dumps(meta))
+    open(f"{d}/messages.jsonl", "w").write("".join(r + "\n" for r in recs))
+    if lock is not None:
+        open(f"{d}/.lock", "w").write(json.dumps({"pid": lock, "started_at": "x"}))
+    return d
+V3A = "sess_3a000000-1111-2222-3333-444444444444"
+V3S = "sess_5b000000-1111-2222-3333-444444444444"
+ID["mg1"] = "mg100000-1111-2222-3333-444444444444"
+V3M = f"cli_{ID['mg1']}_Ab12Cd34"
+dir_a = v3session("ws1aaaa", V3A, "V3 native", "2026-10-20T10:00:00.123Z", "2026-10-21T10:00:00.456Z", [
+    v3rec("n1", "agent_note", "<session_context>v3word injected</session_context>"),
+    v3rec("u1", "user", "v3word from you in v3", source="chat", documents=[]),
+    v3rec("t1", "turn_start", turnId="x"),
+    v3rec("r1", "assistant", "v3secret reasoning about v3word", operationType="Reasoning", reasoningSignature="sig"),
+    v3rec("a1", "assistant", "v3word reply from kiro", operationType="Say"),
+    v3rec("c1", "tool_call", None, name="read"),
+    v3rec("c1-result", "tool_result", "v3toolword output"),
+    v3rec("s1", "user", "[LIVE STEERING - New message from user]\n\nv3word steering wrapper"),
+    v3rec("s2", "user", "v3word steered message", source="steer"),
+    v3rec("tb", "tombstone", None, kind="summarization"),
+    v3rec("summary_1", "assistant", "v3word summary text", operationType="Summary"),
+    v3rec("compact_1_u1", "user", "v3word from you in v3", source="chat"),
+    "{ broken json",
+], lock=LIVE)
+v3session("ws1aaaa", V3S, "V3 helper", "2026-10-20T09:00:00Z", "2026-10-20T09:30:00Z",
+          [v3rec("u1", "user", "v3word subagent instructions")], createdReason="subagent")
+session("mg1", "Migrated", "2026-10-01T10:00:00Z", "2026-10-02T10:00:00Z", [prompt("migratedword in the v2 original")])
+dir_m = v3session("ws2bbbb", V3M, "Migrated", "2026-10-01T10:00:00.000000+00:00", "2026-10-22T10:00:00Z", [
+    v3rec("u1", "user", "migratedword in the v2 original", source="chat"),
+    v3rec("a1", "assistant", "migratedword continued in v3", operationType="Say")])
+os.makedirs(f"{ROOT}/ws1aaaa/.index")
+open(f"{ROOT}/ws1aaaa/.index/.lock", "w").write("")
+rc, _, err = cli("--index-only")
+rows = {l.split("\t")[0]: l.split("\t") for l in open(f"{CACHE}/sessions.tsv").read().splitlines()}
+check("V3 sessions indexed, as store v3 with their conversation file",
+      rows.get(V3A, [""] * 10)[8:] == ["v3", f"{dir_a}/messages.jsonl"] and rows.get(V3M, [""] * 10)[8] == "v3", (rc, err, rows.get(V3A)))
+check("a V2 session with a V3 copy is left out", ID["mg1"] not in rows and not os.path.exists(f"{CACHE}/meta/{ID['mg1']}"), sorted(rows))
+check("V3 times: fractions and +00:00 read right", rows[V3A][4] == "2026-10-21T10:00:00Z"
+      and rows[V3M][6] == local("2026-10-01T10:00:00Z", "%Y-%m-%d %H:%M"), (rows[V3A][4:7], rows[V3M][4:7]))
+check("V3 subagent session marked", rows[V3S][1] == "sub")
+names = text_files()
+check("copies named by the id after sess_; a V2 session's copy keeps its suffix",
+      f"~/work dir/{local('2026-10-20T10:00:00Z', '%Y-%m-%d')} #3a000000.chat" in names
+      and f"~/work dir/{local('2026-10-01T10:00:00Z', '%Y-%m-%d')} #mg100000_Ab12Cd34.chat" in names, names)
+short.update(v3a="3a000000", v3s="5b000000", v3m="mg100000")
+ca = open(f"{CACHE}/text/~/work dir/{local('2026-10-20T10:00:00Z', '%Y-%m-%d')} #3a000000.chat", "rb").read()
+check("V3 copy: prompts, replies, steering messages and summaries only, each once",
+      ca == "<!-- you · 2 -->\nv3word from you in v3\n\n<!-- kiro · 5 -->\nv3word reply from kiro\n\n"
+            "<!-- you · 9 -->\nv3word steered message\n\n<!-- summary · 11 -->\nv3word summary text\n\n".encode(), ca)
+check("V3 copy equals reading it from scratch", ca == extract_full(V3A, f"{dir_a}/messages.jsonl"))
+with open(f"{dir_a}/messages.jsonl", "a") as f:
+    f.write(v3rec("u9", "user", "v3word added later", source="chat") + "\n")
+cli("--index-only")
+ca2 = open(f"{CACHE}/text/~/work dir/{local('2026-10-20T10:00:00Z', '%Y-%m-%d')} #3a000000.chat", "rb").read()
+check("V3 session: only the added part read, result exact", ca2 == ca + "<!-- you · 14 -->\nv3word added later\n\n".encode()
+      and ca2 == extract_full(V3A, f"{dir_a}/messages.jsonl")
+      and int(open(f"{CACHE}/state/{V3A}").read().split("\t")[1]) == os.path.getsize(f"{dir_a}/messages.jsonl"), ca2[-120:])
+
+s = Session(v2=False)
+q, m = s.state()
+check("without --v2: only V3 sessions, newest first, no subagent", ids(m) == [short["v3m"], short["v3a"]], ids(m))
+check("...no note", b"no V3 sessions yet" not in s.out)
+check("...a running V3 session is tagged live", "● live" in fields(m[1])[-1], m)
+s.key(b"v3word")
+q, m = s.state()
+check("V3 search: prompts, reply, steering message, summary", [fields(x)[-1] for x in m] == [
+      "you│ v3word from you in v3", "kiro│ v3word reply from kiro", "you│ v3word steered message",
+      "summary│ v3word summary text", "you│ v3word added later"], m)
+s.key(CLR + b"v3secret|v3toolword|injected|steering wrapper")
+check("...never reasoning, tool output, Kiro's notes or steering wrappers", s.state()[1] == [], s.state())
+s.key(CLR + b"canary")
+check("...V2 sessions not searched", s.state()[1] == [])
+s.key(b"\x1bs")
+s.key(CLR + b"v3word subagent")
+check("Alt-S: V3 subagent session, its prompts by agent", [fields(x)[-1] for x in s.state()[1]] == ["agent│ v3word subagent instructions"], s.state())
+s.key(b"\x1bs")
+s.key(CLR + b"v3word reply")
+s.wait_for(lambda q, m: len(m) == 1)
+raw = s.finish(b"\x1b\r")
+try:
+    r = json.loads(raw.decode())["results"][0]
+except (ValueError, IndexError, KeyError):
+    r = {}
+check("V3 JSON: store, resume with --v3, its file, live with pid",
+      (r.get("store"), r.get("resume"), r.get("session_file"), r.get("live"), r.get("pid"), r.get("session_id"))
+      == ("v3", f"cd '{WORK}' && kiro-cli chat --v3 --resume-id '{V3A}'", f"{dir_a}/messages.jsonl", True, LIVE, V3A), (raw[:300], r))
+check("...and the record points at that message", r.get("record") == 5 and b"v3word reply from kiro" in
+      open(f"{dir_a}/messages.jsonl", "rb").read().split(b"\n")[4], r)
+
+s = Session()
+s.key(b"migratedword")
+q, m = s.state()
+check("--v2: a migrated session shows once, as its V3 copy", ids(m) == [short["v3m"], short["v3m"]]
+      and all("#mg100000_Ab12Cd34.chat" in fields(x)[0] for x in m), m)
+s.key(CLR + b"canary")
+check("--v2: V2 sessions searched too", ids(s.state()[1]) == [short["b2"], short["d4"]], s.state())
+s.finish(b"\x1b")
+
+open(f"{H}/list3", "w").write(f"{ID['mg1']}\n{dir_a}/\n")
+s = Session(cmd=f"bash '{run}' < '{H}/list3'")
+check("piped: a migrated session's V2 id and a V3 folder", ids(s.state()[1]) == [short["v3m"], short["v3a"]], s.state())
+s.finish(b"\x1b")
+open(f"{H}/list4", "w").write(f"{dir_m}/messages.jsonl\n{dir_a}/session.json\n")
+s = Session(cmd=f"bash '{run}' < '{H}/list4'")
+check("piped: V3 session files", ids(s.state()[1]) == [short["v3m"], short["v3a"]], s.state())
 s.finish(b"\x1b")
 
 print("--- index updates seen by the picker")

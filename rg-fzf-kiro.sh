@@ -4,11 +4,20 @@
 show_help() {
     cat << 'EOF'
 Usage: rg-fzf-kiro [options]
+       command | rg-fzf-kiro [options]
 
-Search your saved Kiro CLI conversations by what was said. Alt-Enter prints the
-selected sessions as JSON, with the command to resume each one.
+Search your saved Kiro CLI conversations by what was said. Enter prints the paths of
+the selected sessions' readable copies (plain Markdown files), so rg-fzf or another
+rg-fzf-kiro can search them further: rg-fzf-kiro | rg-fzf. Alt-Enter prints them as
+JSON, with the command to resume each. Piped in, a list of copies, session ids or
+Kiro session files limits the search to those sessions.
+
+Shows Kiro CLI V3 sessions. --v2 adds the ones in the older V2 store; a V2 session
+you resumed under V3 shows once, as its V3 copy.
 
 Options:
+  --v2          Also show V2 sessions
+  -0, --null    Enter separates the paths with NUL instead of newlines
   --reindex     Rebuild the search index from scratch
   --index-only  Update the search index and exit
   -h, --help    Show help
@@ -17,16 +26,18 @@ Keybindings:
   Ctrl-E      Open the readable copy of the conversation in $EDITOR at the line
   Ctrl-F      Toggle chat search / session filter
   Alt-L       Only show running (live) sessions
-  Alt-T       Also search tool calls and tool output
   Alt-S       Also include subagent sessions
   Alt-P       Toggle PCRE2 (lookarounds, backreferences)
+  Alt-U       Toggle one result per session (its first match)
+  Alt-R       Show messages by: everyone, only you, only Kiro (cycles)
   Tab         Toggle selection and move to the next line
   Shift-Tab   Toggle selection and move to the previous line
   Ctrl-A      Select all
   Ctrl-Z      Deselect all
-  Enter       Print selected lines (or the current line) and exit
-  Alt-Enter   Same, as JSON: session id, title, directory, a resume
-              command, live status and the matched line (needs jq)
+  Enter       Print the readable copies of the selected lines' sessions and exit
+  Ctrl-O      Print the selected lines as shown, and exit
+  Alt-Enter   Print the selected lines as JSON: session id, title, directory, a
+              resume command, live status and the matched line
   Ctrl-P      Toggle preview
   Ctrl-D      Scroll preview down
   Ctrl-U      Scroll preview up
@@ -36,17 +47,20 @@ Keybindings:
   Esc         Exit
 
 Rows show the session's directory (~ is your home folder), the date it started
-and its short id, then who wrote the line: you, kiro, summary, agent (a subagent
-session's instructions from the main Kiro), call and output (tool activity). In
-the copy and the preview each message starts with a comment like
+and its short id, then who wrote the line: you, kiro, summary (Kiro's summary when
+a conversation was compacted) or agent (a subagent session's instructions from the
+main Kiro). In the copy and the preview each message starts with a comment like
 "<!-- kiro · 12 -->": who wrote it and its line (record) in Kiro's session file.
+Tool calls and their output are not searched.
 
 Prompt: "Chat (regex)" searches conversations; "Sessions (fuzzy)" filters by
-directory, date or id. Flags: [L] live only, [T] tool output, [S] subagent
-sessions, [P] PCRE2 (shown in the session filter).
+directory, date or id. Flags: [L] live only, [S] subagent sessions, [U] one result
+per session, [P] PCRE2 (shown in the session filter), [R:you] or [R:kiro] whose
+messages are shown (Kiro's include its summaries).
 
 Environment:
-  KIRO_SESSIONS_DIR   Where Kiro saves sessions (default ~/.kiro/sessions/cli)
+  KIRO_HOME           Kiro's folder (default ~/.kiro)
+  KIRO_SESSIONS_DIR   Where Kiro saves sessions (default $KIRO_HOME/sessions)
   RG_FZF_KIRO_CACHE   Where the search index is kept (default ~/.cache/rg-fzf-kiro)
 EOF
 }
@@ -62,8 +76,12 @@ done
 
 REINDEX=0
 INDEX_ONLY=0
+SHOW_V2=0
+NUL_OUT=0
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --v2) SHOW_V2=1; shift ;;
+        -0|--null) NUL_OUT=1; shift ;;
         --reindex) REINDEX=1; shift ;;
         --index-only) INDEX_ONLY=1; shift ;;
         -h|--help) show_help; exit 0 ;;
@@ -71,7 +89,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-SESSIONS=${KIRO_SESSIONS_DIR:-$HOME/.kiro/sessions/cli}
+# Kiro keeps V3 sessions in $SESSIONS/<workspace>/<id>/ and V2 sessions in $SESSIONS/cli/
+KIRO_DIR=${KIRO_HOME:-$HOME/.kiro}
+SESSIONS=${KIRO_SESSIONS_DIR:-$KIRO_DIR/sessions}
+V2DIR="$SESSIONS/cli"
 CACHE=${RG_FZF_KIRO_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/rg-fzf-kiro}
 TEXT="$CACHE/text"
 INDEX="$CACHE/sessions.tsv"
@@ -83,49 +104,85 @@ HOME_DIR=${HOME%/}
 [[ $HOME_DIR == /* ]] || HOME_DIR=""
 
 # Bump when the index layout or extracted text changes: the whole index is rebuilt
-FORMAT=6
+FORMAT=7
 
 # Private directory for the generated helper scripts and picker state, removed on exit
 STATE=$(mktemp -d) || die "cannot create a temporary directory"
 trap 'rm -rf "$STATE"' EXIT
 
+# A pipe or a file on stdin lists the sessions to search. (/dev/null, as in cron,
+# counts as nothing given.) It is read now and checked once the index is up to date.
+PIPED=0
+if [[ $INDEX_ONLY == 0 ]] && [[ -p /dev/stdin || -f /dev/stdin ]]; then
+    PIPED=1
+    cat > "$STATE/raw"
+fi
+
 # ===========================================================================
 # Index
 #
-# Every session becomes two plain-text files that ripgrep searches, stored in
-# folders that mirror the session's directory:
+# Every session becomes a plain-text copy that ripgrep searches, stored in folders
+# that mirror the session's directory:
 #   text/<dir>/<started> #<id8>.chat    your prompts, Kiro's replies, compaction summaries
-#   text/<dir>/<started> #<id8>.tools   tool calls and their output
 # <dir> is the session's directory, with "~" for your home folder. Each message starts
 # with a marker comment, "<!-- kiro · 12 -->": who wrote it, and its record (line) in
-# the session's .jsonl.
+# the session's file. Tool calls and output, and Kiro's hidden reasoning, are left out.
 #
-# Kiro only ever appends to a session's .jsonl, so the index remembers how many
-# bytes of each one it has read and later reads only what was added. Per session:
-#   meta/<id>   one tab-separated row: id kind rel cwd updated_utc updated started title
-#   seen/<id>   the .json's modification time when meta/<id> was made
+# Sessions come from two stores. V3: <sessions>/<workspace>/<id>/session.json (title,
+# directory, dates) and messages.jsonl (the conversation). V2: <sessions>/cli/<id>.json
+# and <id>.jsonl. A V2 session resumed under V3 is copied by Kiro to the V3 store as
+# cli_<V2 id>_<suffix>, with all of its history; the V2 original is then left out.
+#
+# Kiro only ever appends to a session's conversation file, so the index remembers how
+# many bytes of each one it has read and later reads only what was added. Per session:
+#   meta/<id>   one tab-separated row: id kind rel cwd updated_utc updated started
+#               title store src (store is v2 or v3; src is Kiro's conversation file)
+#   seen/<id>   the metadata file's modification time when meta/<id> was made
 #   state/<id>  format, bytes read, checksums of the start and of the last 64 bytes
-#               read, sizes of the two text files, their location (rel), kind, and
-#               how many records (lines) of the .jsonl were read
-# If a .jsonl shrank, its start or read end changed, or the text files are not the
-# sizes recorded (e.g. after an interrupted run), that session is rebuilt from scratch.
+#               read, size of the copy, its location (rel), kind, and how many
+#               records (lines) were read
+# If a conversation file shrank, its start or read end changed, or the copy is not the
+# size recorded (e.g. after an interrupted run), that session is rebuilt from scratch.
 # ===========================================================================
 
 # Session metadata -> index row. Every column is non-empty, because bash's read
 # merges empty tab-separated columns. kind is "sub" for subagent sessions: ones
-# another session started (parent_session_id) for a subagent. /rewind also creates
-# child sessions, which are the user's own ("main"). rel is the index file path
-# without extension; "." and ".." in a directory can't escape the index folder.
+# another session started for a subagent. (V2's /rewind also creates child sessions,
+# which are the user's own: "main".) rel is the copy's path without extension; "."
+# and ".." in a directory can't escape the index folder. The short id in the name is
+# the id's first 8 characters after V3's "sess_" or "cli_" prefix; a V2 session's V3
+# copy (cli_<id>_<suffix>) keeps its suffix, so two copies never share a name.
 cat > "$STATE/meta.jq" << 'JQ'
 def nocontrol: tostring | explode | map(if . < 32 or . == 127 then 32 else . end) | implode;
 def nonempty($d): if . == "" then $d else . end;
-def localtime($fmt): tostring | sub("\\.[0-9]+Z$"; "Z") | try (fromdate | strflocaltime($fmt)) catch null;
+# Seconds since 1970 from an ISO 8601 time, with or without fractional seconds, and
+# "Z", "+05:30", "-0800" or no zone (taken as UTC)
+def epoch:
+    tostring
+    | capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\\.[0-9]+)?(?<z>Z|[+-][0-9]{2}:?[0-9]{2})?$")
+    | (.d + "Z" | fromdate)
+      - (if .z == null or .z == "Z" then 0
+         else (if .z[0:1] == "-" then -1 else 1 end) * ((.z[1:3] | tonumber) * 3600 + (.z[-2:] | tonumber) * 60) end);
+def localtime($fmt): try (epoch | strflocaltime($fmt)) catch null;
+def utc: (try (epoch | todate) catch null) // nocontrol;
 def part: if . == "." then "_." elif . == ".." then "_.." else . end;
-def row($id):
-    select(type == "object") |
-    (.cwd // "" | nocontrol) as $cwd |
-    (.created_at // .updated_at // "" | tostring) as $c |
-    (.updated_at // .created_at // "" | tostring) as $u |
+def short($id):
+    ($id | capture("^cli_(?<u>[A-Za-z0-9.-]+)_(?<s>[A-Za-z0-9]+)$") | "\(.u[0:8])_\(.s)")
+    // ($id | sub("^sess_"; "") | .[0:8]);
+# V3 and V2 metadata, in the same terms
+def fields($store):
+    if $store == "v3" then
+        {cwd: (.workspacePaths[0]? // .rootPaths[0]? // ""), created: (.createdAt // .lastModifiedAt // ""),
+         updated: (.lastModifiedAt // .createdAt // ""), title: .title, sub: (.createdReason == "subagent")}
+    else
+        {cwd: (.cwd // ""), created: (.created_at // .updated_at // ""), updated: (.updated_at // .created_at // ""),
+         title: .title, sub: ((.parent_session_id and .session_created_reason == "subagent") // false)}
+    end;
+def row($id; $store; $src):
+    select(type == "object") | fields($store) as $m |
+    ($m.cwd | nocontrol) as $cwd |
+    ($m.created | tostring) as $c |
+    ($m.updated | tostring) as $u |
     (if $cwd == "" then ["(no directory)"]
      elif $home != "" and ($cwd == $home or ($cwd | startswith($home + "/"))) then
          ["~"] + ($cwd[($home | length):] | split("/") | map(select(. != "") | part))
@@ -135,39 +192,42 @@ def row($id):
      end) as $dir |
     ($c | localtime("%Y-%m-%d") // ($c | nocontrol | .[0:10]) | nonempty("0000-00-00")) as $day |
     [ $id,
-      (if .parent_session_id and .session_created_reason == "subagent" then "sub" else "main" end),
-      ($dir + ["\($day) #\($id[0:8])"] | join("/")),
+      (if $m.sub then "sub" else "main" end),
+      ($dir + ["\($day) #\(short($id))"] | join("/")),
       ($cwd | nonempty(".")),
-      ($u | nocontrol | nonempty("0")),
+      ($u | utc | nonempty("0")),
       ($u | localtime("%Y-%m-%d %H:%M") // ($u | nocontrol) | nonempty("unknown")),
       ($c | localtime("%Y-%m-%d %H:%M") // ($c | nocontrol) | nonempty("unknown")),
-      (.title // "" | nocontrol | gsub("^ +| +$"; "") | nonempty("untitled"))
+      ($m.title // "" | nocontrol | gsub("^ +| +$"; "") | nonempty("untitled")),
+      $store,
+      ($src | nocontrol)
     ] | join("\t");
-# Input: one line per session, "<id>\t<its .json on one line>". Output: its row,
-# or "<id>\tBAD" if the .json is not a session (then the old row is kept).
-inputs | index("\t") as $i | .[:$i] as $id
-| (.[$i + 1:] | try fromjson catch null) as $j
-| [$j | row($id)] | first // "\($id)\tBAD"
+# Input: one line per session, "<id>\t<store>\t<conversation file>\t<metadata on one
+# line>". Output: its row, or "<id>\tBAD" if that is not a session (the old row is kept).
+inputs | split("\t") as $f
+| ($f[3:] | join("\t") | try fromjson catch null) as $j
+| [$j | row($f[0]; $f[1]; $f[2])] | first // "\($f[0])\tBAD"
 JQ
 
-# Session .jsonl (raw lines) -> the readable copy, as Markdown. Each message starts
-# with a comment line saying who wrote it and which line of the .jsonl (the record)
-# it came from: "<!-- kiro · 12 -->". Then its text, then a blank line. Output lines
-# are prefixed "C" for the chat copy or "T" for the tool-activity copy.
+# Conversation file (raw lines, V2 or V3) -> the readable copy, as Markdown. Each
+# message starts with a comment line saying who wrote it and which line of the file
+# (the record) it came from: "<!-- kiro · 12 -->". Then its text, then a blank line.
 # $base is how many records came before this input (when reading only what was added).
 # $asker labels the prompts: "you", or "agent" in a subagent session, whose prompts
 # come from the main Kiro rather than from you. A record that is not valid JSON is
 # skipped. Control characters are removed: a NUL would make ripgrep treat the file as
 # binary, and escape codes would garble the list. A text line that looks exactly like
-# a marker gets a leading space, so it can't be mistaken for one. Kiro's hidden
-# reasoning is never included.
+# a marker gets a leading space, so it can't be mistaken for one. Left out: Kiro's
+# hidden reasoning, tool calls and output, and in V3, Kiro's own bookkeeping, the
+# copies of earlier messages it re-adds after a compaction (ids "compact_..."), and
+# the "[LIVE STEERING" notes that repeat a message you sent while Kiro was working.
 cat > "$STATE/extract.jq" << 'JQ'
 def clean: gsub("[\u0000-\u0008\u000b-\u001f\u007f]"; "");
 def message($role; $rec):
     "<!-- \($role) · \($rec) -->",
     (split("\n")[] | clean | if test("^<!-- [a-z]+ · [0-9]+ -->$") then " " + . else . end),
     "";
-def chat($rec):
+def v2($rec):
     if .kind == "Prompt" then
         .data.content[]? | select(.kind == "text") | .data | strings | message($asker; $rec)
     elif .kind == "AssistantMessage" then
@@ -175,19 +235,19 @@ def chat($rec):
     elif .kind == "Compaction" then
         .data.summary | strings | message("summary"; $rec)
     else empty end;
-def tools($rec):
-    if .kind == "AssistantMessage" then
-        .data.content[]? | select(.kind == "toolUse") | .data | objects
-        | "\(.name) \(.input | tojson)" | message("call"; $rec)
-    elif .kind == "ToolResults" then
-        .data.content[]? | .data | objects | .content[]? | objects
-        | if .kind == "text" then .data | strings
-          elif .kind == "json" then .data | tojson
-          else empty end
-        | message("output"; $rec)
-    else empty end;
+def v3($rec):
+    if (.id | tostring | startswith("compact_")) then empty
+    else .payload | objects |
+        if .type == "user" then
+            .content | strings | select(length > 0 and (startswith("[LIVE STEERING") | not)) | message($asker; $rec)
+        elif .type == "assistant" and (.operationType == "Say" or .operationType == null) then
+            .content | strings | select(length > 0) | message("kiro"; $rec)
+        elif .type == "assistant" and .operationType == "Summary" then
+            .content | strings | message("summary"; $rec)
+        else empty end
+    end;
 inputs | ($base + input_line_number) as $rec
-| try (fromjson | (chat($rec) | "C" + .), (tools($rec) | "T" + .)) catch empty
+| try (fromjson | objects | if has("payload") then v3($rec) else v2($rec) end) catch empty
 JQ
 
 
@@ -203,7 +263,7 @@ use File::Path qw(make_path remove_tree);
 use POSIX ();
 use Time::HiRes ();
 
-my ($CACHE, $SESSIONS, $FORMAT, $HOME, $REINDEX, $JQ_META, $JQ_EXTRACT, $JOBS) = @ARGV;
+my ($CACHE, $V2, $V3, $FORMAT, $HOME, $REINDEX, $JQ_META, $JQ_EXTRACT, $JOBS) = @ARGV;
 my $TEXT = "$CACHE/text";
 my $INDEX = "$CACHE/sessions.tsv";
 my $TMP = "$CACHE/tmp";
@@ -306,20 +366,45 @@ if ($REINDEX eq '1' || !defined $version || $version ne $FORMAT) {
 make_path($TEXT, "$CACHE/meta", "$CACHE/seen", "$CACHE/state");
 -d "$CACHE/$_" or fail("cannot create the index in $CACHE") for qw(text meta seen state);
 
-# --- scan the sessions folder --------------------------------------------------------
-opendir(my $dh, $SESSIONS) or fail("cannot read $SESSIONS");
-my (@ids, %size, %mtime);
-for my $f (sort readdir $dh) {
-    next unless $f =~ /^([A-Za-z0-9][A-Za-z0-9._-]*)\.json\z/;
-    my $id = $1;
-    my @j = Time::HiRes::stat("$SESSIONS/$f") or next;
-    next unless -f "$SESSIONS/$f";
+# --- scan both stores -------------------------------------------------------------------
+my (@ids, %size, %mtime, %metaf, %src, %store);
+sub add_session {
+    my ($id, $store, $meta, $data) = @_;
+    return if exists $store{$id};
+    my @j = Time::HiRes::stat($meta) or return;
+    return unless -f $meta;
     push @ids, $id;
+    ($store{$id}, $metaf{$id}, $src{$id}) = ($store, $meta, $data);
     $mtime{$id} = sprintf('%.9f', $j[9]);
-    my @l = stat("$SESSIONS/$id.jsonl");
-    $size{$id} = (@l && -f "$SESSIONS/$id.jsonl") ? $l[7] : undef;
+    my @l = stat($data);
+    $size{$id} = (@l && -f $data) ? $l[7] : undef;
 }
-closedir $dh;
+my $ID = qr/^[A-Za-z0-9][A-Za-z0-9._-]*\z/;
+# V3: <sessions>/<workspace>/<id>/. A cli_<V2 id>_<suffix> session is a V2 session
+# Kiro copied over when it was resumed under V3; the V2 original is then skipped.
+my %migrated;
+if (opendir(my $top, $V3)) {
+    for my $w (sort readdir $top) {
+        next if $w =~ /^\./ || $w eq 'cli' || !-d "$V3/$w";
+        opendir(my $wd, "$V3/$w") or next;
+        for my $id (sort readdir $wd) {
+            next unless $id =~ $ID && -f "$V3/$w/$id/session.json";
+            add_session($id, 'v3', "$V3/$w/$id/session.json", "$V3/$w/$id/messages.jsonl");
+            $migrated{$1} = 1 if $id =~ /^cli_([A-Za-z0-9.-]+)_[A-Za-z0-9]+\z/;
+        }
+        closedir $wd;
+    }
+    closedir $top;
+}
+# V2: <sessions>/cli/<id>.json and <id>.jsonl
+if (opendir(my $dh, $V2)) {
+    for my $f (sort readdir $dh) {
+        next unless $f =~ /^([A-Za-z0-9][A-Za-z0-9._-]*)\.json\z/;
+        next if $migrated{$1};
+        add_session($1, 'v2', "$V2/$f", "$V2/$1.jsonl");
+    }
+    closedir $dh;
+}
 
 # --- metadata: one jq run for every session whose .json changed ----------------------
 # A .json that can't be read or parsed keeps its previous row, and is tried again
@@ -332,10 +417,10 @@ if (@changed) {
     my $in = "$TMP/meta.in";
     open(my $f, '>:raw', $in) or fail("cannot write to $CACHE");
     for my $id (@changed) {
-        my $c = slurp("$SESSIONS/$id.json");
+        my $c = slurp($metaf{$id});
         next unless defined $c;
         $c =~ tr/\r\n/  /;
-        print $f "$id\t$c\n" or fail("cannot write to $CACHE");
+        print $f "$id\t$store{$id}\t$src{$id}\t$c\n" or fail("cannot write to $CACHE");
     }
     close $f or fail("cannot write to $CACHE");
     my $pid = open(my $jq, '-|');
@@ -348,7 +433,7 @@ if (@changed) {
     while (my $line = <$jq>) {
         chomp $line;
         my @c = split /\t/, $line, -1;
-        next unless @c == 8 && exists $mtime{$c[0]};
+        next unless @c == 10 && exists $mtime{$c[0]};
         put("$CACHE/meta/$c[0]", "$line\n") && put("$CACHE/seen/$c[0]", "$mtime{$c[0]}\n");
     }
     close $jq;
@@ -362,7 +447,7 @@ for my $id (@ids) {
     my $row = first_line("$CACHE/meta/$id");
     next unless defined $row && length $row;
     my ($kind, $rel) = (split /\t/, $row, -1)[1, 2];
-    my ($fmt, $off, undef, undef, undef, undef, $oldrel, $oldkind) = state_of($id);
+    my ($fmt, $off, undef, undef, undef, $oldrel, $oldkind) = state_of($id);
     my $current = defined $fmt && $fmt eq $FORMAT && num($off) && defined $oldkind && $oldkind eq $kind;
     next if $current && $off == $size{$id} && defined $oldrel && $oldrel eq $rel;
     my $left = ($current && $off <= $size{$id}) ? $size{$id} - $off : $size{$id};
@@ -373,27 +458,26 @@ if ($bytes >= 1 << 20) {
     printf STDERR "rg-fzf-kiro: indexing %d session(s), %d MB...\n", scalar @work, $bytes >> 20;
 }
 
-# Brings one session's two text files up to date. Returns 1 on success. On failure
-# nothing is recorded, so the next run tries again (and rebuilds if needed).
+# Brings one session's copy up to date. Returns 1 on success. On failure nothing is
+# recorded, so the next run tries again (and rebuilds if needed).
 sub index_one {
     my ($id, $rel, $kind) = @_;
-    my $src = "$SESSIONS/$id.jsonl";
-    my ($chat, $tools) = ("$TEXT/$rel.chat", "$TEXT/$rel.tools");
-    my ($fmt, $off, $head, $tail, $csz, $tsz, $oldrel, $oldkind, $recs) = state_of($id);
+    my $src = $src{$id};
+    my $chat = "$TEXT/$rel.chat";
+    my ($fmt, $off, $head, $tail, $csz, $oldrel, $oldkind, $recs) = state_of($id);
     open(my $in, '<:raw', $src) or return 0;
     my $size = (stat $in)[7];
 
     # Continue from where the last run stopped, if the file still starts and reads
-    # the same up to there, and the text files are exactly as that run left them.
+    # the same up to there, and the copy is exactly as that run left it.
     my $append = defined $fmt && $fmt eq $FORMAT && num($off) && $off > 0 && $size >= $off
         && defined $oldkind && $oldkind eq $kind
         && defined $oldrel && length $oldrel
         && (sum_head($in, $off) // '-') eq ($head // '') && (sum_tail($in, $off) // '-') eq ($tail // '')
         && num($csz) && (fsize("$TEXT/$oldrel.chat") // -1) == $csz
-        && num($tsz) && (fsize("$TEXT/$oldrel.tools") // -1) == $tsz
         && num($recs);
     if ($append && $oldrel ne $rel && !same_file("$TEXT/$oldrel.chat", $chat)) {
-        $append = ensure_dir($chat) && rename("$TEXT/$oldrel.chat", $chat) && rename("$TEXT/$oldrel.tools", $tools);
+        $append = ensure_dir($chat) && rename("$TEXT/$oldrel.chat", $chat);
     }
     ($off, $recs) = (0, 0) unless $append;
 
@@ -409,9 +493,8 @@ sub index_one {
     my $keep = length $chunk;
     my $added = ($chunk =~ tr/\n//);
 
-    my ($tc, $tt) = ("$TMP/$id.c", "$TMP/$id.t");
+    my $tc = "$TMP/$id.c";
     open(my $oc, '>:raw', $tc) or return 0;
-    open(my $ot, '>:raw', $tt) or return 0;
     if ($keep > 0) {
         my $cf = "$TMP/$id.chunk";
         open(my $f, '>:raw', $cf) or return 0;
@@ -426,21 +509,18 @@ sub index_one {
                  '-f', $JQ_EXTRACT)
                 or POSIX::_exit(127);
         }
-        while (my $l = <$jq>) {
-            if ($l =~ s/^C//) { print $oc $l or return 0 }
-            elsif ($l =~ s/^T//) { print $ot $l or return 0 }
-        }
+        while (my $l = <$jq>) { print $oc $l or return 0 }
         close($jq) or return 0;
         unlink $cf;
     }
-    close($oc) && close($ot) or return 0;
+    close($oc) or return 0;
 
     # Commit: text first, then the state, so an interrupted run is caught by the size check
     if ($append) {
-        append_file($tc, $chat) && append_file($tt, $tools) or return 0;
-        unlink $tc, $tt;
+        append_file($tc, $chat) or return 0;
+        unlink $tc;
     } else {
-        ensure_dir($chat) && rename($tc, $chat) && rename($tt, $tools) or return 0;
+        ensure_dir($chat) && rename($tc, $chat) or return 0;
     }
     my $newoff = $off + $keep;
     my ($h, $t) = ('none', 'none');
@@ -449,7 +529,7 @@ sub index_one {
         return 0 unless defined $h && defined $t;
     }
     return put("$CACHE/state/$id",
-        join("\t", $FORMAT, $newoff, $h, $t, fsize($chat) // 0, fsize($tools) // 0, $rel, $kind, $recs + $added) . "\n");
+        join("\t", $FORMAT, $newoff, $h, $t, fsize($chat) // 0, $rel, $kind, $recs + $added) . "\n");
 }
 
 my $running = 0;
@@ -468,12 +548,12 @@ for my $w (sort { $b->[0] <=> $a->[0] || $a->[1] cmp $b->[1] } @work) {
 }
 1 while waitpid(-1, 0) > 0;
 
-# --- forget deleted sessions -----------------------------------------------------------
+# --- forget deleted sessions (and V2 originals that now have a V3 copy) ---------------
 for my $sub (qw(meta seen state)) {
     opendir(my $d, "$CACHE/$sub") or next;
     for my $id (readdir $d) {
         next if $id eq '.' || $id eq '..';
-        my $ok = -f "$SESSIONS/$id.json" && ($sub ne 'state' || -f "$SESSIONS/$id.jsonl");
+        my $ok = exists $metaf{$id} && ($sub ne 'state' || defined $size{$id});
         unlink "$CACHE/$sub/$id" unless $ok;
     }
     closedir $d;
@@ -485,7 +565,7 @@ for my $id (@ids) {
     my $r = first_line("$CACHE/meta/$id");
     next unless defined $r && length $r;
     my @c = split /\t/, $r, -1;
-    push @rows, [$r, \@c] if @c == 8;
+    push @rows, [$r, \@c] if @c == 10;
 }
 @rows = sort { $b->[1][4] cmp $a->[1][4] || $a->[1][0] cmp $b->[1][0] } @rows;
 put($INDEX, join('', map { "$_->[0]\n" } @rows)) or fail("cannot write $INDEX");
@@ -497,12 +577,11 @@ put($INDEX, join('', map { "$_->[0]\n" } @rows)) or fail("cannot write $INDEX");
 my (%keep, %keep_id);
 for my $r (@rows) {
     my ($id, $rel) = @{ $r->[1] }[0, 2];
-    next unless -f "$SESSIONS/$id.jsonl";
-    for my $p ("$TEXT/$rel.chat", "$TEXT/$rel.tools") {
-        $keep{$p} = 1;
-        my @s = stat $p;
-        $keep_id{"$s[0]:$s[1]"} = 1 if @s;
-    }
+    next unless defined $size{$id};
+    my $p = "$TEXT/$rel.chat";
+    $keep{$p} = 1;
+    my @s = stat $p;
+    $keep_id{"$s[0]:$s[1]"} = 1 if @s;
 }
 my @files;
 File::Find::find({ no_chdir => 1, wanted => sub { push @files, $File::Find::name if -f $File::Find::name } }, $TEXT);
@@ -520,24 +599,74 @@ exit 0;
 PERL
 
 JOBS=$(getconf _NPROCESSORS_ONLN 2> /dev/null)
-perl "$STATE/indexer.pl" "$CACHE" "$SESSIONS" "$FORMAT" "$HOME_DIR" "$REINDEX" \
+perl "$STATE/indexer.pl" "$CACHE" "$V2DIR" "$SESSIONS" "$FORMAT" "$HOME_DIR" "$REINDEX" \
     "$STATE/meta.jq" "$STATE/extract.jq" "$JOBS" || exit 1
 
 [[ $INDEX_ONLY == 1 ]] && exit 0
+
+# Piped sessions: one per line, or NUL-separated if the list contains a NUL. Each can
+# be a readable copy (what Enter prints), a session id, or one of Kiro's files or
+# folders for the session (V2: cli/<id>.jsonl, .json...; V3: <id>/ and the files in
+# it). A V2 session that now has a V3 copy is found by its V2 id too. Each must be in
+# the index. Saved as " id id ... " in $STATE/only.
+if [[ $PIPED == 1 ]]; then
+    read -r ok bad < <(perl -e '
+        my ($raw, $index, $text, $out) = @ARGV;
+        my %known;    # every name of a session -> its id
+        open(my $i, "<", $index) or exit 1;
+        while (<$i>) {
+            chomp;
+            my @c = split /\t/;
+            my ($id, $rel, $src) = @c[0, 2, 9];
+            $known{$_} = $id for $id, "$rel.chat", "$text/$rel.chat", $src;
+            $known{$1} = $id if $id =~ /^cli_([A-Za-z0-9.-]+)_[A-Za-z0-9]+\z/;
+        }
+        open(my $r, "<:raw", $raw) or exit 1;
+        my $d = do { local $/; <$r> } // "";
+        my ($bad, %ok, @order) = (0);
+        for (split($d =~ /\0/ ? qr/\0/ : qr/\n/, $d)) {
+            s/^\s+|\s+\z//g;
+            next if $_ eq "";
+            (my $e = $_) =~ s{/+\z}{};
+            my $id = $known{$e};
+            unless (defined $id) {
+                my @p = split m{/}, $e;
+                (my $base = $p[-1] // "") =~ s/\.[^.]*\z//;
+                $id = $known{$base} // $known{$p[-1] // ""} // (@p > 1 ? $known{$p[-2]} : undef);
+            }
+            if (defined $id) { push @order, $id unless $ok{$id}++ } else { $bad++ }
+        }
+        open(my $o, ">", $out) or exit 1;
+        print $o " ", join(" ", @order), " ";
+        print scalar(@order), " $bad\n";
+    ' "$STATE/raw" "$INDEX" "$TEXT" "$STATE/only")
+    rm -f "$STATE/raw"
+    [[ ${ok:-0} == 0 && ${bad:-0} == 0 ]] && die "no sessions given on stdin"
+    [[ ${ok:-0} == 0 ]] && die "none of the sessions given on stdin are known"
+    [[ $bad -gt 0 ]] && echo "rg-fzf-kiro: skipped $bad unknown session(s) from stdin" >&2
+fi
+
+[[ $SHOW_V2 == 1 ]] && touch "$STATE/v2"
+if [[ $SHOW_V2 == 0 && $PIPED == 0 ]] &&
+    ! awk -F '\t' '$9 == "v3" { found = 1; exit } END { exit !found }' "$INDEX"; then
+    echo "rg-fzf-kiro: no V3 sessions yet; --v2 shows your V2 sessions" >&2
+fi
 
 # ===========================================================================
 # Interactive picker. Same design as rg-fzf: result lines are FILE, LINE,
 # COLUMN and TEXT joined by NUL + ':', so the fields split exactly.
 # ===========================================================================
 
-HEADER_CHAT='C-e:edit | M-enter:json | C-f:sessions | M-l:live | M-t:tools | M-s:subagents | M-p:pcre2 | M-/:keys'
-HEADER_SESSIONS='C-e:edit | M-enter:json | C-f:chat | M-l:live | M-t:tools | M-s:subagents | M-p:pcre2 | M-/:keys'
+HEADER_CHAT='C-e:edit | C-o:lines | M-enter:json | C-f:sessions | M-l:live | M-s:subagents | M-u:unique | M-r:role | M-p:pcre2 | M-/:keys'
+HEADER_SESSIONS='C-e:edit | C-o:lines | M-enter:json | C-f:chat | M-l:live | M-s:subagents | M-u:unique | M-r:role | M-p:pcre2 | M-/:keys'
 
 # Picker state in $STATE: content-q and file-q hold the saved query of each mode;
-# live, tools, sub and pcre2 exist while that toggle is on; listing exists while the
-# list shows sessions (empty query) rather than matching lines; in-sessions exists
-# while the session filter is active; nonum exists while preview line numbers are off.
-# rg-fzf-kiro-keybindings.txt is the read-only keybinding list that Alt-/ opens.
+# live, sub, pcre2 and unique exist while that toggle is on; role holds "you" or
+# "kiro" while Alt-R limits whose messages show; v2 exists with --v2; only holds the
+# piped session ids; listing exists while the list shows sessions (empty query)
+# rather than matching lines; in-sessions exists while the session filter is active;
+# nonum exists while preview line numbers are off. rg-fzf-kiro-keybindings.txt is
+# the read-only keybinding list that Alt-/ opens.
 SEARCH="$STATE/search.sh"
 ACTIONS="$STATE/actions.sh"
 KEYS_FILE="$STATE/rg-fzf-kiro-keybindings.txt"
@@ -552,10 +681,8 @@ our %ROLE = (
     agent   => "\e[1;34m",    # bold blue: prompts in a subagent session, from the main Kiro
     kiro    => "\e[1;32m",    # bold green
     summary => "\e[1;35m",    # bold magenta
-    call    => "\e[33m",      # yellow
-    output  => "\e[2m",       # dim
 );
-our $MARKER = qr/^<!-- (you|agent|kiro|summary|call|output) \x{c2}\x{b7} ([0-9]+) -->$/;
+our $MARKER = qr/^<!-- (you|agent|kiro|summary) \x{c2}\x{b7} ([0-9]+) -->$/;
 my %marks;
 # Markers of a copy, as [line, role, record] sorted by line (read once per file)
 sub marks_of {
@@ -587,10 +714,18 @@ sub mark_at {
 PERL
 
 # List rows: adds who wrote each matched line, colored, and drops matches on the marker
-# comments themselves. Only the displayed text changes; the copy is untouched.
+# comments themselves. Then, while Alt-R is on, drops rows not written by that role,
+# and while Alt-U is on, rows of a session already shown. Only the displayed text
+# changes; the copy is untouched.
 cat > "$STATE/color-rows.pl" << 'PERL'
-require shift @ARGV;
+my ($roles, $state) = @ARGV;
+require $roles;
 our (%ROLE);
+my $unique = -e "$state/unique";
+my $want = "";
+if (open(my $r, '<', "$state/role")) { $want = <$r> // ""; chomp $want }
+my $allowed = { you => { you => 1 }, kiro => { kiro => 1, summary => 1 } }->{$want};
+my %seen;
 $| = 1;
 while (my $l = <STDIN>) {
     my @f = split /\0:/, $l, 4;
@@ -599,6 +734,10 @@ while (my $l = <STDIN>) {
     s/\e\[[0-9;]*m//g for $path, $n;
     my $m = mark_at(marks_of($path), $n);
     next if $m && $m->[0] == $n;
+    next if $allowed && !($m && $allowed->{$m->[1]});
+    if ($unique) {
+        next if $seen{$path}++;
+    }
     $f[3] = "$ROLE{$m->[1]}$m->[1]\x{e2}\x{94}\x{82}\e[0m " . $f[3] if $m;
     print join("\0:", @f);
 }
@@ -685,18 +824,19 @@ PERL
 cat > "$STATE/json.jq" << 'JQ'
 ($index | split("\n") | map(select(length > 0) | split("\t")
     | {key: .[2], value: {session_id: .[0], subagent: (.[1] == "sub"), directory: .[3],
-                          updated_at: .[4], updated: .[5], started: .[6], title: .[7]}}) | from_entries) as $sessions
+                          updated_at: .[4], updated: .[5], started: .[6], title: .[7],
+                          store: .[8], session_file: .[9]}}) | from_entries) as $sessions
 | ($live | split(" ") | map(select(length > 0) | split(":") | {key: .[0], value: (.[1] | tonumber)}) | from_entries) as $pids
 | {query: $query}
 + (if $filter != "" then {session_filter: $filter} else {} end)
 + {results: [inputs | split("\u0001") as $f
-    | ($f[0] | sub("\\.(chat|tools)$"; "")) as $rel
+    | ($f[0] | sub("\\.chat$"; "")) as $rel
     | $sessions[$rel] as $s | select($s != null)
-    | {session_id: $s.session_id, title: $s.title, directory: $s.directory,
-       resume: "cd \($s.directory | @sh) && kiro-cli chat --resume-id \($s.session_id | @sh)",
+    | {session_id: $s.session_id, title: $s.title, directory: $s.directory, store: $s.store,
+       resume: "cd \($s.directory | @sh) && kiro-cli chat --\($s.store) --resume-id \($s.session_id | @sh)",
        live: ($pids[$s.session_id] != null), pid: $pids[$s.session_id],
        subagent: $s.subagent, started: $s.started, updated: $s.updated, updated_at: $s.updated_at,
-       session_file: "\($sessions_dir)/\($s.session_id).jsonl"}
+       session_file: $s.session_file}
       + (if $listing == "1" then {} else
           {copy: "\($text_dir)/\($f[0])", line: ($f[1] | tonumber), column: ($f[2] | tonumber),
            record: (if $f[4] == "" then null else $f[4] | tonumber end),
@@ -707,7 +847,7 @@ JQ
 # Both helpers start with the paths they need and how to read Kiro's lock files
 helper_header() {
     echo '#!/bin/bash'
-    printf 'S=%q\nSESSIONS=%q\nTEXT=%q\nINDEX=%q\n' "$STATE" "$SESSIONS" "$TEXT" "$INDEX"
+    printf 'S=%q\nV2DIR=%q\nV3DIR=%q\nTEXT=%q\nINDEX=%q\n' "$STATE" "$V2DIR" "$SESSIONS" "$TEXT" "$INDEX"
     cat << 'SCRIPT'
 # Classifies running pids by their command: "kiro", "other", or "unknown" when the
 # command can't be read (some sandboxes block ps). Prints "pid status" lines.
@@ -722,7 +862,8 @@ classify() {
         END { for (p in st) print p, st[p] }'
 }
 
-# Kiro writes {"pid": N, ...} to <id>.lock while a kiro-cli has the session open.
+# While a kiro-cli has a session open, Kiro writes {"pid": N, ...} to a lock file:
+# cli/<id>.lock for V2, <workspace>/<id>/.lock for V3.
 # Sets LOCK_PID; fails if there is no readable pid.
 read_lock_pid() {
     local content=""
@@ -738,12 +879,18 @@ read_lock_pid() {
 live_scan() {
     local lock id ids=() pids=() i statuses
     LIVE=" "
-    for lock in "$SESSIONS"/*.lock; do
+    for lock in "$V2DIR"/*.lock "$V3DIR"/*/*/.lock; do
         [[ -f $lock ]] || continue
         read_lock_pid "$lock" || continue
         kill -0 "$LOCK_PID" 2> /dev/null || continue
-        id=${lock##*/}
-        ids+=("${id%.lock}")
+        if [[ $lock == */.lock ]]; then
+            id=${lock%/.lock}
+            id=${id##*/}
+        else
+            id=${lock##*/}
+            id=${id%.lock}
+        fi
+        ids+=("$id")
         pids+=("$LOCK_PID")
     done
     (( ${#pids[@]} )) || return 0
@@ -775,14 +922,29 @@ else
 fi
 LIVE_ONLY=0
 [[ -f $S/live ]] && LIVE_ONLY=1
+# Piped sessions, " id id ... ": only these are searched, whatever their store or kind
+ONLY=$(cat "$S/only" 2>/dev/null)
+SHOW_V2=0
+[[ -f $S/v2 ]] && SHOW_V2=1
+# Whether a session (id, kind, store) is listed: piped sessions are exactly the ones
+# named; otherwise subagent sessions need Alt-S, and V2 sessions need --v2
+keep() {
+    if [[ -n $ONLY ]]; then
+        [[ $ONLY == *" $1 "* ]]
+        return
+    fi
+    [[ $2 == sub && ! -f $S/sub ]] && return 1
+    [[ $3 == v2 && $SHOW_V2 == 0 ]] && return 1
+    return 0
+}
 LIVE=" "
 [[ -z $Q || $LIVE_ONLY == 1 ]] && live_scan
 cd "$TEXT" || exit 0
 
 if [[ -z $Q ]]; then
     touch "$S/listing"
-    while IFS=$'\t' read -r id kind rel _ _ updated _; do
-        [[ $kind == sub && ! -f $S/sub ]] && continue
+    while IFS=$'\t' read -r id kind rel _ _ updated _ _ store _; do
+        keep "$id" "$kind" "$store" || continue
         tag=""
         [[ $LIVE == *" $id:"* ]] && tag=$'  \033[33m● live\033[0m'
         [[ $LIVE_ONLY == 1 && -z $tag ]] && continue
@@ -803,18 +965,17 @@ ENGINE=default
 # Index files to search, in session-list order. rg -j1 searches them in that order;
 # --max-columns shortens huge lines in the list (they are still searched in full).
 # xargs -r runs nothing if no file is left.
-while IFS=$'\t' read -r id kind rel _; do
-    [[ $kind == sub && ! -f $S/sub ]] && continue
+while IFS=$'\t' read -r id kind rel _ _ _ _ _ store _; do
+    keep "$id" "$kind" "$store" || continue
     [[ $LIVE_ONLY == 1 && $LIVE != *" $id:"* ]] && continue
     [[ -s $rel.chat ]] && printf '%s\0' "$rel.chat"
-    [[ -f $S/tools && -s $rel.tools ]] && printf '%s\0' "$rel.tools"
 done < "$INDEX" | if [[ -n $FILE_Q ]]; then
     fzf --filter "$FILE_Q" --read0 --print0 --no-sort
 else
     cat
 fi | xargs -0 -r rg -j1 --engine "$ENGINE" --ignore-case --column --line-number --no-heading \
     --color=always --with-filename --field-match-separator '\x00:' --max-columns 500 \
-    --max-columns-preview -e "$Q" -- 2> /dev/null | perl "$COLOR_ROWS" "$ROLES"
+    --max-columns-preview -e "$Q" -- 2> /dev/null | perl "$COLOR_ROWS" "$ROLES" "$S"
 exit 0
 SCRIPT
 } > "$SEARCH"
@@ -827,13 +988,13 @@ SCRIPT
         "$SEARCH" "$STATE/roles.pl" "$STATE/preview.pl" "$STATE/json.pl" "$STATE/json.jq"
     printf 'HEADER_CHAT=%q\nHEADER_SESSIONS=%q\n' "$HEADER_CHAT" "$HEADER_SESSIONS"
     cat << 'SCRIPT'
-# Result file name ("<rel>.chat" or "<rel>.tools") -> session row.
-# Sets id kind cwd updated started title.
+# Result file name ("<rel>.chat") -> session row.
+# Sets id kind cwd updated started title store.
 row_of_file() {
     local line
     line=$(B="${1%.*}" awk -F '\t' '$3 == ENVIRON["B"] { print; exit }' "$INDEX")
     [[ -n $line ]] || return 1
-    IFS=$'\t' read -r id kind _ cwd _ updated started title <<< "$line"
+    IFS=$'\t' read -r id kind _ cwd _ updated started title store _ <<< "$line"
 }
 
 # Prompt: mode, how the typed text is matched, then active toggles.
@@ -842,13 +1003,14 @@ prompt() {
     local how=regex flags=""
     [[ -f $S/pcre2 ]] && how=pcre2
     [[ -f $S/live ]] && flags+="L"
-    [[ -f $S/tools ]] && flags+="T"
     [[ -f $S/sub ]] && flags+="S"
+    [[ -f $S/unique ]] && flags+="U"
     if [[ $1 == Sessions ]]; then
         [[ $how == pcre2 ]] && flags+="P"
         how=fuzzy
     fi
     [[ -n $flags ]] && flags=" [$flags]"
+    [[ -s $S/role ]] && flags+=" [R:$(cat "$S/role")]"
     echo "$1 ($how)$flags> "
 }
 
@@ -868,9 +1030,18 @@ case $1 in
             echo "reload(sleep 0.1; '$SEARCH' {q})"
         fi
         ;;
-    toggle-live|toggle-tools|toggle-sub|toggle-pcre2)
+    toggle-live|toggle-sub|toggle-pcre2|toggle-unique)
         f="$S/${1#toggle-}"
         if [[ -f $f ]]; then rm -f "$f"; else touch "$f"; fi
+        echo "change-prompt($(prompt $MODE))+$RELOAD"
+        ;;
+    cycle-role)
+        # everyone -> you -> kiro -> everyone
+        case $(cat "$S/role" 2>/dev/null) in
+            "") echo you > "$S/role" ;;
+            you) echo kiro > "$S/role" ;;
+            *) rm -f "$S/role" ;;
+        esac
         echo "change-prompt($(prompt $MODE))+$RELOAD"
         ;;
     switch-mode)
@@ -891,6 +1062,7 @@ case $1 in
         row_of_file "$2" || { echo "Session not found"; exit 0; }
         kindnote=""
         [[ $kind == sub ]] && kindnote="  (subagent)"
+        [[ $store == v2 ]] && kindnote+="  (v2)"
         live_scan
         printf '\033[1mtitle\033[0m    %s\n' "$title"
         printf '\033[1msession\033[0m  %s%s\n' "$id" "$kindnote"
@@ -911,7 +1083,7 @@ case $1 in
         [[ -f $S/listing ]] && listing=1
         perl "$JSON_PL" "$ROLES" "$TEXT" |
             jq -Rn --arg query "$2" --arg filter "$3" --arg live "$LIVE" --arg listing "$listing" \
-                --arg text_dir "$TEXT" --arg sessions_dir "$SESSIONS" --rawfile index "$INDEX" -f "$JSON_JQ"
+                --arg text_dir "$TEXT" --rawfile index "$INDEX" -f "$JSON_JQ"
         ;;
 esac
 SCRIPT
@@ -920,14 +1092,35 @@ SCRIPT
 chmod +x "$SEARCH" "$ACTIONS"
 cd "$TEXT" || die "cannot open $TEXT"
 
-# fzf prints the query, the key that closed it (empty for Enter, "alt-enter" for
-# Alt-Enter), then the selected lines. Enter: plain file:line:column:text, with the
-# NUL separators removed (LC_ALL=C keeps any byte intact). Alt-Enter: JSON.
+# fzf prints the query, the key that closed it (empty for Enter), then the selected
+# lines. Enter: the full paths of those lines' readable copies, each once, in
+# session-list order (most recently updated first), one per line or NUL-separated
+# with -0; only copies in the index are printed. Ctrl-O:
+# the lines as file:line:column:text, with the NUL separators removed (LC_ALL=C keeps
+# any byte intact). Alt-Enter: JSON.
 print_selection() {
     local query key filter=""
     IFS= read -r query || return 0
     IFS= read -r key || return 0
-    if [[ $key != alt-enter ]]; then
+    if [[ -z $key ]]; then
+        LC_ALL=C perl -e '
+            my ($index, $text, $nul) = @ARGV;
+            my $sep = $nul ? "\0" : "\n";
+            my %want;
+            while (my $l = <STDIN>) {
+                my ($f) = split /\0:/, $l, 2;
+                $f =~ s/\e\[[0-9;]*m//g;
+                $f =~ s/\.chat\z//;
+                $want{$f} = 1;
+            }
+            open(my $i, "<", $index) or exit 1;
+            while (<$i>) {
+                my (undef, undef, $rel) = split /\t/;
+                print "$text/$rel.chat$sep" if delete $want{$rel};
+            }' "$INDEX" "$TEXT" "$NUL_OUT"
+        return
+    fi
+    if [[ $key == ctrl-o ]]; then
         LC_ALL=C tr -d '\0'
         return
     fi
@@ -952,7 +1145,7 @@ fzf \
   --multi \
   --delimiter '\x00:' \
   --nth 1 \
-  --expect alt-enter \
+  --expect alt-enter,ctrl-o \
   --print-query \
   --prompt 'Chat (regex)> ' \
   --header "$HEADER_CHAT" \
@@ -960,9 +1153,10 @@ fzf \
   --bind "change:transform:'$ACTIONS' query-changed" \
   --bind "ctrl-f:transform:'$ACTIONS' switch-mode" \
   --bind "alt-l:transform:'$ACTIONS' toggle-live" \
-  --bind "alt-t:transform:'$ACTIONS' toggle-tools" \
   --bind "alt-s:transform:'$ACTIONS' toggle-sub" \
   --bind "alt-p:transform:'$ACTIONS' toggle-pcre2" \
+  --bind "alt-u:transform:'$ACTIONS' toggle-unique" \
+  --bind "alt-r:transform:'$ACTIONS' cycle-role" \
   --bind "ctrl-e:execute:$EDIT_CMD" \
   --bind "tab:toggle+up" \
   --bind "shift-tab:toggle+down" \
@@ -976,4 +1170,4 @@ fzf \
   --bind "alt-/:execute:$KEYS_CMD" \
   --bind "f1:execute:$KEYS_CMD" \
   --preview "'$ACTIONS' preview {1} {2}" \
-  --preview-window 'up,60%,border-bottom,+{2}+6/3,~6' | print_selection
+  --preview-window 'up,60%,border-bottom,+{2}+6/3,~6' < /dev/null | print_selection
