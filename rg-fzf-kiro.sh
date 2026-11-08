@@ -25,7 +25,7 @@ Options:
 Keybindings:
   Ctrl-E      Open the readable copy of the conversation in $EDITOR at the line
   Ctrl-F      Toggle chat search / session filter
-  Alt-L       Only show running (live) sessions
+  Alt-G       Only show running (live) sessions
   Alt-S       Also include subagent sessions
   Alt-P       Toggle PCRE2 (lookarounds, backreferences)
   Alt-U       Toggle one result per session (its first match)
@@ -657,8 +657,8 @@ fi
 # COLUMN and TEXT joined by NUL + ':', so the fields split exactly.
 # ===========================================================================
 
-HEADER_CHAT='C-e:edit | C-o:lines | M-enter:json | C-f:sessions | M-l:live | M-s:subagents | M-u:unique | M-r:role | M-p:pcre2 | M-/:keys'
-HEADER_SESSIONS='C-e:edit | C-o:lines | M-enter:json | C-f:chat | M-l:live | M-s:subagents | M-u:unique | M-r:role | M-p:pcre2 | M-/:keys'
+HEADER_CHAT='C-e:edit | C-o:lines | M-enter:json | C-f:sessions | M-g:live | M-s:subagents | M-u:unique | M-r:role | M-p:pcre2 | M-/:keys'
+HEADER_SESSIONS='C-e:edit | C-o:lines | M-enter:json | C-f:chat | M-g:live | M-s:subagents | M-u:unique | M-r:role | M-p:pcre2 | M-/:keys'
 
 # Picker state in $STATE: content-q and file-q hold the saved query of each mode;
 # live, sub, pcre2 and unique exist while that toggle is on; role holds "you" or
@@ -1152,7 +1152,7 @@ fzf \
   --bind "start:reload:'$SEARCH' ''" \
   --bind "change:transform:'$ACTIONS' query-changed" \
   --bind "ctrl-f:transform:'$ACTIONS' switch-mode" \
-  --bind "alt-l:transform:'$ACTIONS' toggle-live" \
+  --bind "alt-g:transform:'$ACTIONS' toggle-live" \
   --bind "alt-s:transform:'$ACTIONS' toggle-sub" \
   --bind "alt-p:transform:'$ACTIONS' toggle-pcre2" \
   --bind "alt-u:transform:'$ACTIONS' toggle-unique" \

@@ -12,7 +12,7 @@ Built on the same design as [rg-fzf](https://github.com/officialparacite/rg-fzf)
 - Regex search, with a PCRE2 toggle (`Alt-P`) for lookarounds and backreferences
 - Each row shows the session's directory, so you can tell projects apart at a glance; the title is in the preview
 - Who wrote each line is shown and colored in the list; the preview shows the conversation as Markdown (highlighted with bat), with a colored comment at the start of each message
-- `● live` tag for sessions open in a running kiro-cli, and `Alt-L` to show only those
+- `● live` tag for sessions open in a running kiro-cli, and `Alt-G` to show only those
 - `Alt-U` shows each session once; `Alt-R` shows only your messages or only Kiro's
 - `Enter` prints the paths of the sessions' readable copies, so one search can feed another: `rg-fzf-kiro | rg-fzf` or `rg-fzf-kiro | rg-fzf-kiro`
 - `Alt-Enter` prints the selected lines or sessions as JSON (multi-select with `Tab`), with a ready-to-run resume command
@@ -92,7 +92,7 @@ Piped in, the list can be one entry per line or NUL-separated. Each entry is a r
 |-----|--------|
 | `Ctrl-E` | Open the readable copy of the conversation in `$EDITOR` at the selected line |
 | `Ctrl-F` | Switch between chat search and the session filter |
-| `Alt-L` | Toggle showing only live sessions (off by default) |
+| `Alt-G` | Toggle showing only live sessions (off by default) |
 | `Alt-S` | Toggle including subagent sessions (off by default) |
 | `Alt-P` | Toggle PCRE2, for lookarounds and backreferences (off by default) |
 | `Alt-U` | Toggle one result per session: each session once, at its first match (off by default) |
@@ -186,7 +186,7 @@ The preview shows the session's title, full id, directory, when it started and w
 - **Incremental updates:** Kiro only ever adds to the end of a session's conversation file, so the index remembers how far it read each one and next time reads only what was added, using one pass per session and all CPU cores. A record Kiro is still writing is left for the next run. If a file got shorter, its start or the last part read changed, or an index file was changed outside the tool, that session is rebuilt from scratch. Only one copy of rg-fzf-kiro updates the index at a time; others wait.
 - **One result per session (`Alt-U`) and roles (`Alt-R`):** ripgrep finds every match as usual; then each row's role is looked up, rows from other roles are dropped, and with `Alt-U` only a session's first remaining row is kept. Doing this after the search, rather than stopping ripgrep at each file's first match, means a message's comment line can never stand in for the session's first match.
 - **Session filter (`Ctrl-F`):** fuzzy-filters by the row name, i.e. directory, start date or short id (e.g. `proj`, `#3abe`). Switching back keeps the filter, the same way filename mode works in rg-fzf.
-- **Live sessions:** Kiro keeps a lock file with the process id of the kiro-cli using a session. Every time the list reloads (a keystroke, a toggle, `Alt-L`), the lock files are read again, so a session you open in another terminal shows up as live straight away. A session is live only if that process is still running and is kiro-cli, so locks left by a crash don't count, even if their process id has since been reused by another program. If the process exists but its command can't be read (some sandboxes block this), it is treated as live. The list of sessions and their text is read when the tool starts, so a brand-new session appears after a restart.
+- **Live sessions:** Kiro keeps a lock file with the process id of the kiro-cli using a session. Every time the list reloads (a keystroke, a toggle, `Alt-G`), the lock files are read again, so a session you open in another terminal shows up as live straight away. A session is live only if that process is still running and is kiro-cli, so locks left by a crash don't count, even if their process id has since been reused by another program. If the process exists but its command can't be read (some sandboxes block this), it is treated as live. The list of sessions and their text is read when the tool starts, so a brand-new session appears after a restart.
 - **Subagent sessions** are sessions another session started for a helper agent. You never typed in them, so they are hidden unless you press `Alt-S`, and their prompts are labelled `agent│`. Sessions created by `/rewind` are your own and always shown.
 - **Editing the copy (`Ctrl-E`):** opens the readable copy, not Kiro's session file, so nothing you change there affects the session. The index notices the change and replaces the copy on the next start.
 
